@@ -1,0 +1,3 @@
+[submodule "Sprak.Core"]
+	path = Sprak.Core
+	url = https://github.com/MrCorvid/Sprak-HGL
