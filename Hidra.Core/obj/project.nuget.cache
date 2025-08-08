@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "jvIKq2JMtrU=",
+  "success": true,
+  "projectFilePath": "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Core\\Hidra.Core.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\MrCorvid\\.nuget\\packages\\newtonsoft.json\\13.0.3\\newtonsoft.json.13.0.3.nupkg.sha512",
+    "C:\\Users\\MrCorvid\\.nuget\\packages\\nunit\\4.3.2\\nunit.4.3.2.nupkg.sha512"
+  ],
+  "logs": []
+}

@@ -1,0 +1,27 @@
+{
+  "experiment_serialization": {
+    "base_output_directory": "./experiments",
+    "name_template": "{name}_{date}_{time}",
+    "run_counter_file": "run_counter.txt"
+  },
+  "log_targets": {
+    "default": {
+      "type": "file",
+      "path": "hidra_log.txt"
+    },
+    "console": {
+      "type": "console",
+      "path": null
+    }
+  },
+  "log_tags": {
+    "SIM_CORE": {
+      "level": "Info",
+      "target": "default"
+    },
+    "PARSER": {
+      "level": "Debug",
+      "target": "default"
+    }
+  }
+}s

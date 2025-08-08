@@ -1,0 +1,77 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "Hidra.Core/1.0.0": {
+        "dependencies": {
+          "Newtonsoft.Json": "13.0.3",
+          "Sprak.Core": "1.0.0"
+        },
+        "runtime": {
+          "Hidra.Core.dll": {}
+        }
+      },
+      "Newtonsoft.Json/13.0.3": {
+        "runtime": {
+          "lib/net6.0/Newtonsoft.Json.dll": {
+            "assemblyVersion": "13.0.0.0",
+            "fileVersion": "13.0.3.27908"
+          }
+        }
+      },
+      "NUnit/4.3.2": {
+        "runtime": {
+          "lib/net8.0/nunit.framework.dll": {
+            "assemblyVersion": "4.3.2.0",
+            "fileVersion": "4.3.2.0"
+          },
+          "lib/net8.0/nunit.framework.legacy.dll": {
+            "assemblyVersion": "4.3.2.0",
+            "fileVersion": "4.3.2.0"
+          }
+        }
+      },
+      "Sprak.Core/1.0.0": {
+        "dependencies": {
+          "NUnit": "4.3.2"
+        },
+        "runtime": {
+          "Sprak.Core.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Hidra.Core/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Newtonsoft.Json/13.0.3": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-HrC5BXdl00IP9zeV+0Z848QWPAoCr9P3bDEZguI+gkLcBKAOxix/tLEAAHC+UvDNPv4a2d18lOReHMOagPa+zQ==",
+      "path": "newtonsoft.json/13.0.3",
+      "hashPath": "newtonsoft.json.13.0.3.nupkg.sha512"
+    },
+    "NUnit/4.3.2": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-puVXayXNmEu7MFQSUswGmUjOy3M3baprMbkLl5PAutpeDoGTr+jPv33qAYsqxywi2wJCq8l/O3EhHoLulPE1iQ==",
+      "path": "nunit/4.3.2",
+      "hashPath": "nunit.4.3.2.nupkg.sha512"
+    },
+    "Sprak.Core/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
