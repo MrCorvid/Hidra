@@ -10,25 +10,21 @@ using System.Reflection;
 /// <remarks>
 /// This static class serves as the single source of truth for the HGL virtual machine.
 /// It uses a static constructor to dynamically assign byte values to each opcode based on the
-/// order in the `MasterInstructionOrder` list. This is a deliberate design choice that allows
-/// developers to add or reorder instructions simply by editing the master list, with all
-/// opcode values and lookups adjusting automatically at startup.
+/// order in the `MasterInstructionOrder` list. This design allows developers to add or reorder
+/// instructions simply by editing the master list, with all opcode values and lookups
+/// adjusting automatically at startup.
 /// </remarks>
 public static class HGLOpcodes
 {
-    #region Opcode Constants (Dynamically Initialized)
-
     public static readonly byte NOP, PUSH_BYTE, DUP, POP;
     public static readonly byte StoreLVar, LoadLVar, GetSelfId, GetPosition;
     public static readonly byte StoreGVar, LoadGVar;
-    public static readonly byte CreateNeuron, Apoptosis, CallGene, SetSystemTarget;
+    public static readonly byte CreateNeuron, Apoptosis, Mitosis, CallGene, SetSystemTarget;
     public static readonly byte GetNeighborCount, GetNearestNeighborId, GetNearestNeighborPosition;
     
-    // Synapse opcodes are now a hammer and two scalpels
     public static readonly byte AddSynapse, ModifySynapse;
     public static readonly byte SetSynapseSimpleProperty, SetSynapseCondition;
 
-    // Brain opcodes
     public static readonly byte SetBrainType, ConfigureLogicGate;
     public static readonly byte ClearBrain, AddBrainNode, AddBrainConnection, RemoveBrainNode, RemoveBrainConnection;
     public static readonly byte ConfigureOutputNode, SetBrainInputSource, SetNodeActivationFunction;
@@ -41,18 +37,12 @@ public static class HGLOpcodes
     public static readonly byte ADD, SUB, MUL, DIV, MOD, EQ, NEQ, GT, LT, GTE, LTE;
     public static readonly byte JZ, JMP, JNZ, JNE;
 
-    #endregion
-
-    #region Lookups and Metadata
-
     public static readonly int InstructionCount;
     public static readonly IReadOnlyDictionary<string, byte> OpcodeLookup;
     public static readonly IReadOnlyDictionary<string, byte> OperatorLookup;
     public static readonly IReadOnlyList<string> MasterInstructionOrder;
     public static readonly byte ApiOpcodeStart;
     public static readonly byte OperatorOpcodeStart;
-
-    #endregion
 
     /// <summary>
     /// Initializes the HGLOpcodes class by dynamically assigning values and building lookup tables.
@@ -66,7 +56,7 @@ public static class HGLOpcodes
             "NOP", "PUSH_BYTE", "DUP", "POP",
             // -- Core API --
             "API_StoreLVar", "API_LoadLVar", "API_GetSelfId", "API_GetPosition", "API_StoreGVar", "API_LoadGVar",
-            "API_CreateNeuron", "API_Apoptosis", "API_CallGene", "API_SetSystemTarget", "API_GetNeighborCount",
+            "API_CreateNeuron", "API_Apoptosis", "API_Mitosis", "API_CallGene", "API_SetSystemTarget", "API_GetNeighborCount",
             "API_GetNearestNeighborId", "API_GetNearestNeighborPosition",
             
             "API_AddSynapse", "API_ModifySynapse", 
@@ -93,10 +83,10 @@ public static class HGLOpcodes
 
         for (byte i = 0; i < InstructionCount; i++)
         {
-            string name = MasterInstructionOrder[i];
+            var name = MasterInstructionOrder[i];
             tempOpcodeMap[name] = i;
 
-            string fieldName = name.StartsWith("API_") ? name.Substring(4) : name;
+            var fieldName = name.StartsWith("API_", StringComparison.Ordinal) ? name.Substring(4) : name;
             var fieldInfo = typeof(HGLOpcodes).GetField(fieldName, BindingFlags.Public | BindingFlags.Static);
 
             if (fieldInfo == null)
