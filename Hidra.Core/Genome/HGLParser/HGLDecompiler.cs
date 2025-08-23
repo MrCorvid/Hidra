@@ -1,161 +1,188 @@
 // Hidra.Core/Genome/HGLParser/HGLDecompiler.cs
-namespace Hidra.Core;
-
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using Hidra.Core.Logging;
 
-/// <summary>
-/// Decompiles a raw byte array representing HGL gene code into a structured, linear list of instructions.
-/// This is the first pass of the HGL parsing process.
-/// </summary>
-public class HGLDecompiler
+namespace Hidra.Core
 {
-    /// <summary>
-    /// Represents a single, decoded instruction from the bytecode.
-    /// </summary>
-    public class Instruction
+    public class HGLDecompiler
     {
-        /// <summary>Gets the byte offset of this instruction within the original gene byte array.</summary>
-        public int ByteOffset { get; }
-        /// <summary>Gets the operation code of the instruction.</summary>
-        public byte Opcode { get; }
-        /// <summary>Gets the operand value for the instruction. For jumps, this is a relative offset.</summary>
-        public int Operand { get; }
-        /// <summary>Gets the total size of the instruction in bytes (opcode + operand).</summary>
-        public int Size { get; }
-
-        /// <summary>Initializes a new instance of the <see cref="Instruction"/> class.</summary>
-        /// <param name="byteOffset">The byte offset of this instruction within the original gene byte array.</param>
-        /// <param name="opcode">The operation code of the instruction.</param>
-        /// <param name="operand">The operand value for the instruction.</param>
-        /// <param name="size">The total size of the instruction in bytes (opcode + operand).</param>
-        public Instruction(int byteOffset, byte opcode, int operand, int size)
+        public class Instruction
         {
-            ByteOffset = byteOffset;
-            Opcode = opcode;
-            Operand = operand;
-            Size = size;
-        }
+            public int ByteOffset { get; }
+            public byte Opcode { get; }
+            public int Operand { get; }    // raw immediate (unsigned byte as int for non-push; sign-extended for jumps)
+            public int Size { get; }
 
-        /// <summary>Returns a string representation of the instruction for debugging.</summary>
-        public override string ToString() => $"[0x{ByteOffset:X2}] Op=0x{Opcode:X2}, Operand={Operand}, Size={Size}";
-    }
-
-    /// <summary>
-    /// Contains the complete results of a decompilation pass.
-    /// </summary>
-    /// <param name="Instructions">The linear list of all decoded instructions.</param>
-    /// <param name="JumpSources">A map from a jump instruction's index to its target instruction's index.</param>
-    /// <param name="JumpTargets">A map from a target instruction's index to a list of all instructions that jump to it.</param>
-    public record DecompileResult(
-        List<Instruction> Instructions,
-        Dictionary<int, int> JumpSources,
-        Dictionary<int, List<int>> JumpTargets
-    );
-
-    /// <summary>
-    /// Decompiles a gene's bytecode into a structured list of instructions and analyzes jump targets.
-    /// </summary>
-    /// <param name="geneBytes">The raw byte array of the gene to decompile.</param>
-    /// <returns>A <see cref="DecompileResult"/> containing the structured information.</returns>
-    public DecompileResult Decompile(byte[] geneBytes)
-    {
-        Logger.Log("PARSER", LogLevel.Debug, $"--- Starting Decompilation of {geneBytes.Length} bytes ---");
-        Logger.Log("PARSER", LogLevel.Debug, $"Input Bytes: {string.Concat(geneBytes.Select(b => b.ToString("X2")))}");
-
-        var instructions = DecodeInstructions(geneBytes);
-        var (jumpSources, jumpTargets) = AnalyzeJumps(instructions);
-
-        foreach (var (instr, index) in instructions.Select((instr, index) => (instr, index)))
-        {
-            Logger.Log("PARSER", LogLevel.Debug, $"  [Instruction {index}]: {instr}");
-        }
-
-        Logger.Log("PARSER", LogLevel.Debug, $"Decompilation complete. Found {instructions.Count} instructions.");
-        return new DecompileResult(instructions, jumpSources, jumpTargets);
-    }
-
-    /// <summary>
-    /// Decodes the raw byte array into a linear list of Instruction objects.
-    /// </summary>
-    private static List<Instruction> DecodeInstructions(byte[] geneBytes)
-    {
-        var instructions = new List<Instruction>();
-        var pc = 0;
-        while (pc < geneBytes.Length)
-        {
-            var instructionOffset = pc;
-            byte opcode = geneBytes[pc++];
-            int operand = 0;
-            var size = GetInstructionSize(opcode);
-
-            if (pc < geneBytes.Length)
+            public Instruction(int byteOffset, byte opcode, int operand, int size)
             {
-                if (opcode == HGLOpcodes.PUSH_BYTE)
-                    operand = geneBytes[pc]; // PUSH_BYTE's operand is an unsigned byte literal.
-                else if (IsJumpInstruction(opcode))
-                    operand = (sbyte)geneBytes[pc]; // Jump operands are signed bytes, representing a relative offset.
+                ByteOffset = byteOffset;
+                Opcode = opcode;
+                Operand = operand;
+                Size = size;
             }
-            
-            instructions.Add(new Instruction(instructionOffset, opcode, operand, size));
-            
-            // Advance the program counter by the size of the operand, if any.
-            // The opcode itself was already consumed by pc++.
-            if (size > 1)
-            {
-                pc++;
-            }
+
+            public override string ToString() =>
+                $"[0x{ByteOffset:X2}] {Opcode:X2} (Operand: {Operand}) Size={Size}";
         }
-        return instructions;
-    }
 
-    /// <summary>
-    /// Iterates through the decoded instructions to build jump source and target maps.
-    /// </summary>
-    private static (Dictionary<int, int> JumpSources, Dictionary<int, List<int>> JumpTargets) AnalyzeJumps(List<Instruction> instructions)
-    {
-        var jumpSources = new Dictionary<int, int>();
-        var jumpTargets = new Dictionary<int, List<int>>();
-        var offsetToIndexMap = instructions.Select((instr, index) => new { instr.ByteOffset, index })
-                                           .ToDictionary(item => item.ByteOffset, item => item.index);
-
-        for (var i = 0; i < instructions.Count; i++)
+        public sealed class DecompileResult
         {
-            var instr = instructions[i];
-            if (IsJumpInstruction(instr.Opcode))
+            public List<Instruction> Instructions { get; } = new();
+            /// <summary>
+            /// For an instruction index i that is a jump, JumpSources[i] gives the
+            /// destination instruction index. For non-jumps, it is -1. If the jump
+            /// targets end-of-stream, this value is Instructions.Count (virtual index).
+            /// </summary>
+            public int[] JumpSources { get; internal set; } = Array.Empty<int>();
+            /// <summary>
+            /// Inverse map: dest index -> list of source indices. May contain a key equal to
+            /// Instructions.Count for end-of-stream jumps.
+            /// </summary>
+            public Dictionary<int, List<int>> JumpTargets { get; internal set; } = new();
+        }
+
+        private readonly Action<string, LogLevel, string>? _log;
+
+        public HGLDecompiler(Action<string, LogLevel, string>? logAction = null)
+        {
+            _log = logAction;
+        }
+
+        private void Log(string area, LogLevel level, string message)
+        {
+            _log?.Invoke(area, level, message);
+        }
+
+        public DecompileResult Decompile(byte[] bytes)
+        {
+            var dr = new DecompileResult();
+
+            // 1) Linear decode of instructions
+            int pc = 0;
+            while (pc < bytes.Length)
             {
-                // The target byte offset is relative to the *end* of the current instruction.
-                var targetByteOffset = instr.ByteOffset + instr.Size + instr.Operand;
-                
-                if (offsetToIndexMap.TryGetValue(targetByteOffset, out var targetIndex))
+                byte op = bytes[pc];
+                int size = GetInstructionSize(op);
+
+                if (pc + size > bytes.Length)
                 {
-                    Logger.Log("PARSER", LogLevel.Debug, $"  Jump found at instruction {i} (0x{instr.ByteOffset:X2}) -> instruction {targetIndex} (0x{targetByteOffset:X2}).");
+                    // Truncated/garbage at end — log and stop
+                    Log("PARSER", LogLevel.Warning, $"  Truncated instruction at 0x{pc:X2}. Expected size {size}, bytes left {bytes.Length - pc}. Stopping.");
+                    break;
+                }
+
+                int operand = 0;
+                if (op == HGLOpcodes.PUSH_BYTE)
+                {
+                    operand = bytes[pc + 1]; // literal byte
+                }
+                else if (IsJumpInstruction(op))
+                {
+                    // Signed sbyte displacement
+                    sbyte rel = unchecked((sbyte)bytes[pc + 1]);
+                    operand = rel; // store sign-extended displacement
+                }
+
+                dr.Instructions.Add(new Instruction(pc, op, operand, size));
+                pc += size;
+            }
+
+            // 2) Jump maps (including end-of-stream support)
+            BuildJumpMaps(dr);
+
+            // --- TRACING ---
+            var trace = new StringBuilder();
+            trace.AppendLine("--- DECOMPILED INSTRUCTIONS ---");
+            for (int i = 0; i < dr.Instructions.Count; i++)
+            {
+                var instr = dr.Instructions[i];
+                string jumpInfo = "";
+                if (dr.JumpSources[i] != -1)
+                {
+                    jumpInfo = $" -> Jumps to instruction index {dr.JumpSources[i]}";
+                }
+                trace.AppendLine($"  Index {i,-3} | {instr}{jumpInfo}");
+            }
+            trace.AppendLine("-------------------------------");
+            Log("PARSER", LogLevel.Debug, trace.ToString());
+            // --- END TRACING ---
+
+            return dr;
+        }
+
+        private void BuildJumpMaps(DecompileResult dr)
+        {
+            var instrs = dr.Instructions;
+            int n = instrs.Count;
+
+            // Build an offset->index map for fast lookups at instruction starts
+            var offsetToIndex = new Dictionary<int, int>(n);
+            for (int i = 0; i < n; i++)
+                offsetToIndex[instrs[i].ByteOffset] = i;
+
+            var jumpSources = Enumerable.Repeat(-1, n).ToArray();
+            var jumpTargets = new Dictionary<int, List<int>>();
+
+            int totalBytes = (n == 0) ? 0 : instrs[^1].ByteOffset + instrs[^1].Size;
+
+            for (int i = 0; i < n; i++)
+            {
+                var instr = instrs[i];
+                if (!IsJumpInstruction(instr.Opcode)) continue;
+
+                // Operand is signed displacement relative to (pc + size)
+                int targetByteOffset = instr.ByteOffset + instr.Size + instr.Operand;
+
+                // Accept exact end-of-stream as a valid "virtual" target index == n
+                if (targetByteOffset == totalBytes)
+                {
+                    Log("PARSER", LogLevel.Debug,
+                        $"  Jump found at instruction {i} (0x{instr.ByteOffset:X2}) -> end-of-stream (0x{targetByteOffset:X2}).");
+                    jumpSources[i] = n; // virtual index
+                    if (!jumpTargets.ContainsKey(n)) jumpTargets[n] = new List<int>();
+                    jumpTargets[n].Add(i);
+                    continue;
+                }
+
+                // Otherwise, must land exactly on an instruction boundary we know
+                if (offsetToIndex.TryGetValue(targetByteOffset, out int targetIndex))
+                {
+                    Log("PARSER", LogLevel.Debug,
+                        $"  Jump found at instruction {i} (0x{instr.ByteOffset:X2}) -> instruction {targetIndex} (0x{targetByteOffset:X2}).");
                     jumpSources[i] = targetIndex;
-                    if (!jumpTargets.ContainsKey(targetIndex))
-                    {
-                        jumpTargets[targetIndex] = new List<int>();
-                    }
+                    if (!jumpTargets.ContainsKey(targetIndex)) jumpTargets[targetIndex] = new List<int>();
                     jumpTargets[targetIndex].Add(i);
                 }
                 else
                 {
-                    Logger.Log("PARSER", LogLevel.Warning, $"  Jump at instruction {i} has invalid target offset {targetByteOffset}. It does not land on the start of an instruction.");
+                    Log("PARSER", LogLevel.Warning,
+                        $"  Jump at instruction {i} has invalid target offset {targetByteOffset}. This jump will be ignored.");
                 }
             }
+
+            dr.JumpSources = jumpSources;
+            dr.JumpTargets = jumpTargets;
         }
-        return (jumpSources, jumpTargets);
+
+        // Helpers
+
+        private bool IsJumpInstruction(byte opcode)
+        {
+            return opcode == HGLOpcodes.JZ  ||
+                   opcode == HGLOpcodes.JMP ||
+                   opcode == HGLOpcodes.JNZ ||
+                   opcode == HGLOpcodes.JNE;
+        }
+
+        private int GetInstructionSize(byte opcode)
+        {
+            // PUSH_BYTE and all jumps are 2 bytes; everything else 1 byte.
+            if (opcode == HGLOpcodes.PUSH_BYTE) return 2;
+            if (IsJumpInstruction(opcode)) return 2;
+            return 1;
+        }
     }
-
-    /// <summary>
-    /// Checks if an opcode corresponds to any jump instruction.
-    /// </summary>
-    private static bool IsJumpInstruction(byte opcode) =>
-        opcode >= HGLOpcodes.JZ && opcode <= HGLOpcodes.JNE;
-
-    /// <summary>
-    /// Gets the total size (in bytes) of an instruction, including its operand.
-    /// </summary>
-    private static int GetInstructionSize(byte opcode) =>
-        (opcode == HGLOpcodes.PUSH_BYTE || IsJumpInstruction(opcode)) ? 2 : 1;
 }

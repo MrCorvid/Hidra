@@ -1,156 +1,169 @@
 // Hidra.Core/World/SpatialHash.cs
-namespace Hidra.Core;
-
-using System.Collections.Generic;
-using System.Linq;
-using System.Numerics;
 using Hidra.Core.Logging;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Linq;
+using System;
 
-/// <summary>
-/// A data structure for efficiently querying objects in a 3D space based on proximity.
-/// </summary>
-/// <remarks>
-/// <para>
-/// **THREAD-SAFETY WARNING:** This class is **NOT THREAD-SAFE** by design to maximize performance.
-/// All write operations (<see cref="Insert"/>, <see cref="Clear"/>) must be synchronized externally.
-/// It is designed to be cleared and rebuilt from a single thread during each simulation step.
-/// Read operations (<see cref="FindNeighbors"/>) are safe to perform from multiple threads
-/// ONLY IF no writes are occurring concurrently.
-/// </para>
-/// <para>
-/// It uses a simple object pool for its internal <c>CellEntry</c> objects to reduce
-/// garbage collection pressure during the frequent Clear/Insert cycles.
-/// </para>
-/// </remarks>
-public class SpatialHash
+namespace Hidra.Core
 {
-    // Internal linked-list entry for handling multiple neurons in the same cell.
-    private class CellEntry
-    {
-        public Neuron? Neuron;
-        public CellEntry? Next;
-    }
-
-    private readonly Dictionary<int, CellEntry> _cells = new();
-    private readonly float _cellSize;
-    private readonly float _inverseCellSize;
-
-    // A simple memory pool for CellEntry objects to reduce GC pressure.
-    private readonly List<CellEntry> _entryPool;
-    private int _poolIndex;
-
     /// <summary>
-    /// Initializes a new instance of the <see cref="SpatialHash"/> class.
+    /// A data structure for efficiently querying objects in a 3D space based on proximity.
     /// </summary>
-    /// <param name="cellSize">The size of each grid cell. Should be based on the typical query radius.</param>
-    /// <param name="initialPoolCapacity">The initial number of CellEntry objects to pre-allocate.</param>
-    public SpatialHash(float cellSize, int initialPoolCapacity = 4096)
+    /// <remarks>
+    /// <para>
+    /// **THREAD-SAFETY WARNING:** This class is **NOT THREAD-SAFE** by design to maximize performance.
+    /// All write operations (<see cref="Insert"/>, <see cref="Clear"/>) must be synchronized externally.
+    /// It is designed to be cleared and rebuilt from a single thread during each simulation step.
+    /// Read operations (<see cref="FindNeighbors"/>) are safe to perform from multiple threads
+    /// ONLY IF no writes are occurring concurrently.
+    /// </para>
+    /// <para>
+    /// It uses a simple object pool for its internal <c>CellEntry</c> objects to reduce
+    /// garbage collection pressure during the frequent Clear/Insert cycles.
+    /// </para>
+    /// </remarks>
+    public class SpatialHash
     {
-        _cellSize = cellSize;
-        _inverseCellSize = 1.0f / cellSize;
-        
-        // Pre-allocate the pool to avoid list resizing during insertion.
-        _entryPool = new List<CellEntry>(initialPoolCapacity);
-        for (var i = 0; i < initialPoolCapacity; i++)
+        // Internal linked-list entry for handling multiple neurons in the same cell.
+        private class CellEntry
         {
-            _entryPool.Add(new CellEntry());
+            public Neuron? Neuron;
+            public CellEntry? Next;
         }
-    }
-    
-    /// <summary>
-    /// Clears the spatial hash, returning all pooled entries to the pool for reuse.
-    /// This is an O(1) operation (not counting dictionary clear time).
-    /// </summary>
-    public void Clear()
-    {
-        _cells.Clear();
-        _poolIndex = 0; // Reset the pool index, effectively "freeing" all entries.
-    }
 
-    /// <summary>
-    /// Inserts a neuron into the spatial hash.
-    /// </summary>
-    /// <param name="neuron">The neuron to insert. Must not be null.</param>
-    public void Insert(Neuron neuron)
-    {
-        int ix = (int)Math.Floor(neuron.Position.X * _inverseCellSize);
-        int iy = (int)Math.Floor(neuron.Position.Y * _inverseCellSize);
-        int iz = (int)Math.Floor(neuron.Position.Z * _inverseCellSize);
-        var hash = GetCellHash(ix, iy, iz);
+        private readonly Dictionary<(int x, int y, int z), CellEntry> _cells = new();
+        private readonly float _cellSize;
+        private readonly float _inverseCellSize;
 
-        // Get a pre-allocated entry from the pool.
-        if (_poolIndex >= _entryPool.Count)
+        // A simple memory pool for CellEntry objects to reduce GC pressure.
+        private readonly List<CellEntry> _entryPool;
+        private int _poolIndex = 0;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SpatialHash"/> class.
+        /// </summary>
+        /// <param name="cellSize">The size of each grid cell. Should be based on the typical query radius.</param>
+        /// <param name="initialPoolCapacity">The initial number of CellEntry objects to pre-allocate.</param>
+        public SpatialHash(float cellSize, int initialPoolCapacity = 4096)
         {
-            // The pool is exhausted; grow it to accommodate more entries.
-            _entryPool.Add(new CellEntry());
-        }
-        var entry = _entryPool[_poolIndex++];
-        entry.Neuron = neuron;
-        
-        // Insert at the head of the linked list for this cell hash.
-        if (_cells.TryGetValue(hash, out var head))
-        {
-            entry.Next = head;
-        }
-        else
-        {
-            entry.Next = null;
-        }
-        _cells[hash] = entry;
-    }
-
-    /// <summary>
-    /// Finds all neurons within a given radius of a central neuron.
-    /// </summary>
-    /// <param name="neuron">The neuron at the center of the search area.</param>
-    /// <param name="radius">The search radius.</param>
-    /// <returns>An enumerable collection of neighboring neurons.</returns>
-    public IEnumerable<Neuron> FindNeighbors(Neuron neuron, float radius)
-    {
-        var radiusSq = radius * radius;
-        var position = neuron.Position;
-
-        int minX = (int)Math.Floor((position.X - radius) * _inverseCellSize);
-        int maxX = (int)Math.Floor((position.X + radius) * _inverseCellSize);
-        int minY = (int)Math.Floor((position.Y - radius) * _inverseCellSize);
-        int maxY = (int)Math.Floor((position.Y + radius) * _inverseCellSize);
-        int minZ = (int)Math.Floor((position.Z - radius) * _inverseCellSize);
-        int maxZ = (int)Math.Floor((position.Z + radius) * _inverseCellSize);
-
-        for (int ix = minX; ix <= maxX; ix++)
-        {
-            for (int iy = minY; iy <= maxY; iy++)
+            _cellSize = cellSize;
+            _inverseCellSize = 1.0f / cellSize;
+            
+            _entryPool = new List<CellEntry>(initialPoolCapacity);
+            for (int i = 0; i < initialPoolCapacity; i++)
             {
-                for (int iz = minZ; iz <= maxZ; iz++)
+                _entryPool.Add(new CellEntry());
+            }
+        }
+        
+        /// <summary>
+        /// Clears the spatial hash, returning all pooled entries to the pool for reuse.
+        /// This is an O(1) operation (not counting dictionary clear time).
+        /// </summary>
+        public void Clear()
+        {
+            _cells.Clear();
+
+            // Null-out references in the used portion of the pool to potentially help the GC.
+            for (int i = 0; i < _poolIndex; i++)
+            {
+                var e = _entryPool[i];
+                e.Neuron = null!;
+                e.Next = null!;
+            }
+
+            _poolIndex = 0;
+        }
+
+        /// <summary>
+        /// Inserts a neuron into the spatial hash.
+        /// </summary>
+        /// <param name="neuron">The neuron to insert. Must not be null and must be active.</param>
+        public void Insert(Neuron neuron)
+        {
+            if (neuron == null || !neuron.IsActive) return;
+
+            var p = neuron.Position;
+            int ix = (int)MathF.Floor(p.X * _inverseCellSize);
+            int iy = (int)MathF.Floor(p.Y * _inverseCellSize);
+            int iz = (int)MathF.Floor(p.Z * _inverseCellSize);
+            var key = (ix, iy, iz);
+
+            CellEntry entry;
+            if (_poolIndex < _entryPool.Count)
+            {
+                entry = _entryPool[_poolIndex++];
+            }
+            else
+            {
+                entry = new CellEntry();
+                _entryPool.Add(entry);
+                _poolIndex++;
+            }
+
+            entry.Neuron = neuron;
+            
+            // Insert at the head of the linked list for this cell.
+            if (_cells.TryGetValue(key, out var head))
+            {
+                entry.Next = head;
+                _cells[key] = entry;
+            }
+            else
+            {
+                entry.Next = null;
+                _cells[key] = entry;
+            }
+        }
+
+        /// <summary>
+        /// Finds all neurons within a given radius of a central neuron.
+        /// </summary>
+        /// <param name="neuron">The neuron at the center of the search area.</param>
+        /// <param name="radius">The search radius.</param>
+        /// <returns>An enumerable collection of neighboring neurons.</returns>
+        public IEnumerable<Neuron> FindNeighbors(Neuron neuron, float radius)
+        {
+            if (neuron == null || radius <= 0f) yield break;
+
+            var center = neuron.Position;
+            float r2 = radius * radius;
+
+            int minX = (int)MathF.Floor((center.X - radius) * _inverseCellSize);
+            int maxX = (int)MathF.Floor((center.X + radius) * _inverseCellSize);
+            int minY = (int)MathF.Floor((center.Y - radius) * _inverseCellSize);
+            int maxY = (int)MathF.Floor((center.Y + radius) * _inverseCellSize);
+            int minZ = (int)MathF.Floor((center.Z - radius) * _inverseCellSize);
+            int maxZ = (int)MathF.Floor((center.Z + radius) * _inverseCellSize);
+
+            var emitted = new HashSet<ulong>();
+
+            for (int ix = minX; ix <= maxX; ix++)
+            {
+                for (int iy = minY; iy <= maxY; iy++)
                 {
-                    var hash = GetCellHash(ix, iy, iz);
-                    if (_cells.TryGetValue(hash, out var entry))
+                    for (int iz = minZ; iz <= maxZ; iz++)
                     {
-                        while (entry != null && entry.Neuron != null)
+                        if (_cells.TryGetValue((ix, iy, iz), out var entry))
                         {
-                            // Check for self-collision and perform a precise distance check.
-                            if (entry.Neuron.Id != neuron.Id && Vector3.DistanceSquared(position, entry.Neuron.Position) <= radiusSq)
+                            while (entry != null)
                             {
-                                yield return entry.Neuron;
+                                var candidate = entry.Neuron;
+                                if (candidate != null && candidate.Id != neuron.Id)
+                                {
+                                    var d2 = Vector3.DistanceSquared(center, candidate.Position);
+                                    if (d2 <= r2 && emitted.Add(candidate.Id))
+                                    {
+                                        yield return candidate;
+                                    }
+                                }
+                                entry = entry.Next;
                             }
-                            entry = entry.Next;
                         }
                     }
                 }
             }
         }
-    }
-
-    /// <summary>
-    /// A spatial hashing function to map a 3D grid cell coordinate to a single integer hash.
-    /// </summary>
-    /// <remarks>Uses large prime numbers to help distribute hash values and reduce collisions.</remarks>
-    private static int GetCellHash(int ix, int iy, int iz)
-    {
-        // Constants are large prime numbers to provide a good distribution of hash values.
-        const int p1 = 73856093;
-        const int p2 = 19349663;
-        const int p3 = 83492791;
-        return (ix * p1) ^ (iy * p2) ^ (iz * p3);
     }
 }

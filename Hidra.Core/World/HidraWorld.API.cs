@@ -1,292 +1,667 @@
 // Hidra.Core/World/HidraWorld.API.cs
-namespace Hidra.Core;
-
+using Hidra.Core.Brain;
+using Hidra.Core.Logging;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using System.Text;
 using System.Threading;
-using Hidra.Core.Brain;
 
-/// <summary>
-/// This partial class contains the public Application Programming Interface (API) for the HidraWorld.
-/// It exposes thread-safe methods for querying and modifying the world state from external code,
-/// such as a user interface or a testing framework.
-/// </summary>
-public partial class HidraWorld
+namespace Hidra.Core
 {
     /// <summary>
-    /// Retrieves a neuron by its unique identifier.
+    /// This partial class contains the public Application Programming Interface (API) for the HidraWorld.
+    /// It exposes thread-safe methods for querying and modifying the world state from external code,
+    /// such as a user interface or a testing framework.
     /// </summary>
-    /// <param name="id">The ID of the neuron to find.</param>
-    /// <returns>The found <see cref="Neuron"/> instance, or null if the ID does not exist.</returns>
-    /// <remarks>
-    /// This provides direct, read-only access. SortedDictionary lookups are thread-safe for reads.
-    /// </remarks>
-    public Neuron? GetNeuronById(ulong id) => _neurons.GetValueOrDefault(id);
-
-    /// <summary>
-    /// Retrieves a global input node by its unique identifier.
-    /// </summary>
-    /// <param name="id">The ID of the input node to find.</param>
-    /// <returns>The found <see cref="InputNode"/> instance, or null if the ID does not exist.</returns>
-    public InputNode? GetInputNodeById(ulong id) => _inputNodes.GetValueOrDefault(id);
-
-    /// <summary>
-    /// Retrieves a global output node by its unique identifier.
-    /// </summary>
-    /// <param name="id">The ID of the output node to find.</param>
-    /// <returns>The found <see cref="OutputNode"/> instance, or null if the ID does not exist.</returns>
-    public OutputNode? GetOutputNodeById(ulong id) => _outputNodes.GetValueOrDefault(id);
-
-    /// <summary>
-    /// Finds all neurons within a given radius of a central point using the spatial hash.
-    /// </summary>
-    /// <param name="center">The neuron at the center of the search area.</param>
-    /// <param name="radius">The search radius.</param>
-    /// <returns>An enumeration of all neurons found within the specified radius.</returns>
-    /// <remarks>
-    /// This read operation is only guaranteed to be thread-safe if no write operations
-    /// are being performed on the SpatialHash concurrently. The `HidraWorld.Step()` method
-    /// rebuilds the hash, so this method should not be called from an external thread
-    /// at the exact same time as the simulation step.
-    /// </remarks>
-    public IEnumerable<Neuron> GetNeighbors(Neuron center, float radius) => _spatialHash.FindNeighbors(center, radius);
-
-    /// <summary>
-    /// Gets a read-only view of the global hormones array.
-    /// </summary>
-    /// <returns>The array of global hormone values.</returns>
-    public IReadOnlyList<float> GetGlobalHormones() => GlobalHormones;
-    
-    /// <summary>
-    /// Gets the current values of the specified output nodes. This is a thread-safe read operation.
-    /// </summary>
-    /// <param name="ids">A list of unique identifiers for the output nodes to query.</param>
-    /// <returns>A dictionary mapping each found ID to its current value.</returns>
-    public Dictionary<ulong, float> GetOutputValues(List<ulong> ids)
+    public partial class HidraWorld
     {
-        var results = new Dictionary<ulong, float>();
-        foreach (var id in ids)
+        private const int LVAR_COUNT = 256;
+
+        #region Public Getters (Thread-Safe Reads)
+
+        /// <summary>
+        /// Retrieves a neuron by its unique identifier.
+        /// </summary>
+        /// <param name="id">The ID of the neuron to find.</param>
+        /// <returns>The found <see cref="Neuron"/> instance, or null if the ID does not exist.</returns>
+        public Neuron? GetNeuronById(ulong id)
         {
-            if (_outputNodes.TryGetValue(id, out var node))
+            lock (_worldApiLock)
             {
-                results[id] = node.Value;
+                return _neurons.GetValueOrDefault(id);
             }
         }
-        return results;
-    }
-
-    /// <summary>
-    /// Retrieves a read-only list of events that were processed on a specific tick.
-    /// </summary>
-    /// <param name="tick">The simulation tick to query for events.</param>
-    /// <returns>A read-only list of events for the specified tick, or an empty list if none exist.</returns>
-    public IReadOnlyList<Event> GetEventsForTick(ulong tick)
-    {
-        lock (_eventHistoryLock)
-        {
-            if (_eventHistory.TryGetValue(tick, out var events))
-            {
-                return events.ToList();
-            }
-            return Array.Empty<Event>();
-        }
-    }
-
-    /// <summary>
-    /// Creates and adds a new neuron to the world. This operation is thread-safe.
-    /// </summary>
-    /// <param name="position">The initial position of the neuron in 3D space.</param>
-    /// <returns>The newly created and fully initialized neuron.</returns>
-    public Neuron AddNeuron(Vector3 position)
-    {
-        var newNeuron = new Neuron
-        {
-            Id = (ulong)Interlocked.Increment(ref _nextNeuronId),
-            IsActive = true,
-            Position = position,
-            LocalVariables = new float[256],
-            Brain = CreateDefaultBrain()
-        };
         
-        newNeuron.LocalVariables[(int)LVarIndex.FiringThreshold] = Config.DefaultFiringThreshold;
-        newNeuron.LocalVariables[(int)LVarIndex.DecayRate] = Config.DefaultDecayRate;
-        newNeuron.LocalVariables[(int)LVarIndex.SomaPotential] = Config.InitialPotential;
-        newNeuron.LocalVariables[(int)LVarIndex.Health] = Config.InitialNeuronHealth;
-        newNeuron.LocalVariables[(int)LVarIndex.RefractoryPeriod] = Config.DefaultRefractoryPeriod;
-        newNeuron.LocalVariables[(int)LVarIndex.ThresholdAdaptationFactor] = Config.DefaultThresholdAdaptationFactor;
-        newNeuron.LocalVariables[(int)LVarIndex.ThresholdRecoveryRate] = Config.DefaultThresholdRecoveryRate;
-
-        lock (_worldApiLock)
+        /// <summary>
+        /// Retrieves a synapse by its unique identifier. This is an O(N) operation.
+        /// </summary>
+        /// <param name="id">The ID of the synapse to find.</param>
+        /// <returns>The found <see cref="Synapse"/> instance, or null if the ID does not exist.</returns>
+        public Synapse? GetSynapseById(ulong id)
         {
-            _neurons.Add(newNeuron.Id, newNeuron);
-        }
-
-        // Schedule the "Gestation" gene to run on the next tick. This gene is responsible
-        // for the neuron's initial integration into the network, such as forming its first synapses.
-        var eventId = (ulong)Interlocked.Increment(ref _nextEventId);
-        _eventQueue.Push(new Event { Id = eventId, Type = EventType.ExecuteGene, TargetId = newNeuron.Id, ExecutionTick = CurrentTick + 1, Payload = SYS_GENE_GESTATION });
-
-        return newNeuron;
-    }
-
-    /// <summary>
-    /// Creates a new synapse between any two valid entities (Neuron, InputNode, OutputNode).
-    /// This operation is thread-safe.
-    /// </summary>
-    /// <param name="sourceId">The unique ID of the source entity (Neuron or InputNode).</param>
-    /// <param name="targetId">The unique ID of the target entity (Neuron or OutputNode).</param>
-    /// <param name="signalType">The behavioral type of the synapse's signal transmission.</param>
-    /// <param name="weight">The connection strength, modulating the signal's magnitude.</param>
-    /// <param name="parameter">A multi-purpose parameter (e.g., threshold for inputs, smoothing for outputs).</param>
-    /// <returns>The newly created synapse, or null if the source or target IDs are invalid.</returns>
-    public Synapse? AddSynapse(ulong sourceId, ulong targetId, SignalType signalType, float weight, float parameter)
-    {
-        bool sourceExists = _neurons.ContainsKey(sourceId) || _inputNodes.ContainsKey(sourceId);
-        bool targetExists = _neurons.ContainsKey(targetId) || _outputNodes.ContainsKey(targetId);
-
-        if (!sourceExists || !targetExists)
-        {
-            return null;
-        }
-
-        var synapse = new Synapse
-        {
-            Id = (ulong)Interlocked.Increment(ref _nextSynapseId),
-            SourceId = sourceId,
-            TargetId = targetId,
-            SignalType = signalType,
-            Weight = weight,
-            Parameter = parameter,
-            IsActive = true
-        };
-        
-        return AddSynapseInternal(synapse);
-    }
-
-    /// <summary>
-    /// Adds a new global input node to the world. This operation is thread-safe.
-    /// </summary>
-    /// <param name="id">The unique identifier for the new input node.</param>
-    /// <param name="initialValue">The starting value for the input node.</param>
-    public void AddInputNode(ulong id, float initialValue = 0f)
-    {
-        lock (_worldApiLock)
-        {
-            _inputNodes.TryAdd(id, new InputNode { Id = id, Value = initialValue });
-        }
-    }
-
-    /// <summary>
-    /// Adds a new global output node to the world. This operation is thread-safe.
-    /// </summary>
-    /// <param name="id">The unique identifier for the new output node.</param>
-    public void AddOutputNode(ulong id)
-    {
-        lock (_worldApiLock)
-        {
-            _outputNodes.TryAdd(id, new OutputNode { Id = id, Value = 0f });
-        }
-    }
-
-    /// <summary>
-    /// Sets the values of multiple input nodes at once. This operation is thread-safe for individual writes.
-    /// </summary>
-    /// <param name="values">A dictionary mapping input node IDs to their new values.</param>
-    /// <remarks>
-    /// While individual float assignments are atomic, setting multiple values this way is not a single atomic
-    /// transaction. The simulation might run a tick after some, but not all, values have been updated.
-    /// </remarks>
-    public void SetInputValues(Dictionary<ulong, float> values)
-    {
-        foreach (var (key, value) in values)
-        {
-            if (_inputNodes.TryGetValue(key, out var node))
+            lock (_worldApiLock)
             {
-                node.Value = value;
+                return _synapses.FirstOrDefault(s => s.Id == id);
             }
         }
-    }
 
-    /// <summary>
-    /// Adds a neuron to the deactivation queue to be processed at the end of the current tick.
-    /// </summary>
-    /// <param name="neuron">The neuron to mark for deactivation.</param>
-    /// <remarks>This is the thread-safe entry point for HGL scripts.</remarks>
-    public void MarkNeuronForDeactivation(Neuron neuron)
-    {
-        // Rationale: Adding to a simple List<> is not thread-safe, so we must lock.
-        // A ConcurrentBag<> would also work but a lock is simpler here.
-        lock (_worldApiLock)
+        /// <summary>
+        /// Retrieves a global input node by its unique identifier.
+        /// </summary>
+        /// <param name="id">The ID of the input node to find.</param>
+        /// <returns>The found <see cref="InputNode"/> instance, or null if the ID does not exist.</returns>
+        public InputNode? GetInputNodeById(ulong id)
         {
-            _neuronsToDeactivate.Add(neuron);
-        }
-    }
-
-    /// <summary>
-    /// Handles the biological process of mitosis: copying a neuron and scheduling the Mitosis gene
-    /// for both parent and child.
-    /// </summary>
-    /// <param name="parent">The neuron to copy.</param>
-    /// <param name="offset">The position offset for the new child neuron relative to the parent.</param>
-    /// <returns>The newly created child neuron.</returns>
-    /// <remarks>
-    /// This method intentionally bypasses the standard 'AddNeuron' logic to avoid queuing the Gestation gene.
-    /// </remarks>
-    public Neuron PerformMitosis(Neuron parent, Vector3 offset)
-    {
-        var childNeuron = new Neuron
-        {
-            Id = (ulong)Interlocked.Increment(ref _nextNeuronId),
-            IsActive = true,
-            Position = parent.Position + offset,
-            // The child inherits a complete copy of the parent's local variables.
-            LocalVariables = (float[])parent.LocalVariables.Clone(),
-            // This is a shallow copy of the brain reference. This is usually desired.
-            // If brains were value types or needed unique state, a deep copy would be required.
-            Brain = parent.Brain 
-        };
-        
-        // Reset age for the new neuron.
-        childNeuron.LocalVariables[(int)LVarIndex.Age] = 0;
-
-        lock (_worldApiLock)
-        {
-            _neurons.Add(childNeuron.Id, childNeuron);
+            lock (_worldApiLock)
+            {
+                return _inputNodes.GetValueOrDefault(id);
+            }
         }
 
-        // Queue Mitosis Genes for both the parent and new child neuron.
-        var parentEventId = (ulong)Interlocked.Increment(ref _nextEventId);
-        _eventQueue.Push(new Event { Id = parentEventId, Type = EventType.ExecuteGene, TargetId = parent.Id, ExecutionTick = CurrentTick + 1, Payload = SYS_GENE_MITOSIS });
-        
-        var childEventId = (ulong)Interlocked.Increment(ref _nextEventId);
-        _eventQueue.Push(new Event { Id = childEventId, Type = EventType.ExecuteGene, TargetId = childNeuron.Id, ExecutionTick = CurrentTick + 1, Payload = SYS_GENE_MITOSIS });
-
-        return childNeuron;
-    }
-
-    private static readonly Comparer<Synapse> SynapseIdComparer = Comparer<Synapse>.Create((a, b) => a.Id.CompareTo(b.Id));
-
-    private static void InsertOwnedSynapseSorted(List<Synapse> list, Synapse s)
-    {
-        // Assumes 'list' is already sorted by Id. BinarySearch finds the insertion point.
-        int idx = list.BinarySearch(s, SynapseIdComparer);
-        if (idx < 0) idx = ~idx;
-        list.Insert(idx, s);
-    }
-
-    /// <remarks>
-    /// Rationale: This internal helper centralizes synapse creation logic with two key optimizations:
-    /// 1. It seeds `PreviousSourceValue` to prevent false Rising/Falling edge detections on the first tick.
-    /// 2. It avoids an O(N log N) sort of the global `_synapses` list in the common case where new synapses have ascending IDs.
-    /// 3. It uses a more efficient O(log N) binary search to insert into the denormalized `OwnedSynapses` lists, keeping them sorted.
-    /// </remarks>
-    private Synapse AddSynapseInternal(Synapse synapse)
-    {
-        lock (_worldApiLock)
+        /// <summary>
+        /// Retrieves a global output node by its unique identifier.
+        /// </summary>
+        /// <param name="id">The ID of the output node to find.</param>
+        /// <returns>The found <see cref="OutputNode"/> instance, or null if the ID does not exist.</returns>
+        public OutputNode? GetOutputNodeById(ulong id)
         {
-            // Seed PreviousSourceValue to avoid false Rising/Falling edges on first evaluation.
+            lock (_worldApiLock)
+            {
+                return _outputNodes.GetValueOrDefault(id);
+            }
+        }
+
+        /// <summary>
+        /// Finds all neurons within a given radius of a central neuron using the spatial hash.
+        /// </summary>
+        /// <param name="center">The neuron at the center of the search area.</param>
+        /// <param name="radius">The search radius.</param>
+        /// <returns>A list of all neurons found within the specified radius.</returns>
+        public IEnumerable<Neuron> GetNeighbors(Neuron center, float radius)
+        {
+            lock (_worldApiLock)
+            {
+                return _spatialHash.FindNeighbors(center, radius).ToList(); 
+            }
+        }
+
+        /// <summary>
+        /// Gets a thread-safe, read-only copy of the global hormones array.
+        /// </summary>
+        /// <returns>A new array containing the current global hormone values.</returns>
+        public IReadOnlyList<float> GetGlobalHormones()
+        {
+            lock (_worldApiLock)
+            {
+                return (float[])GlobalHormones.Clone();
+            }
+        }
+        
+        /// <summary>
+        /// Gets the current values of the specified output nodes.
+        /// </summary>
+        /// <param name="ids">A list of unique identifiers for the output nodes to query.</param>
+        /// <returns>A dictionary mapping each found ID to its current value.</returns>
+        public Dictionary<ulong, float> GetOutputValues(List<ulong> ids)
+        {
+            var results = new Dictionary<ulong, float>();
+            lock (_worldApiLock)
+            {
+                foreach (var id in ids)
+                {
+                    if (_outputNodes.TryGetValue(id, out var node))
+                    {
+                        results[id] = node.Value;
+                    }
+                }
+            }
+            return results;
+        }
+
+        /// <summary>
+        /// Retrieves a read-only list of all events associated with a specific tick,
+        /// including both processed historical events and any pending events in the queue.
+        /// </summary>
+        /// <param name="tick">The simulation tick to query for events.</param>
+        /// <returns>A read-only list of events for the specified tick.</returns>
+        public IReadOnlyList<Event> GetEventsForTick(ulong tick)
+        {
+            var results = new List<Event>();
+
+            lock (_eventHistoryLock)
+            {
+                if (_eventHistory.TryGetValue(tick, out var historicalEvents))
+                {
+                    results.AddRange(historicalEvents);
+                }
+            }
+            
+            lock (_worldApiLock)
+            {
+                results.AddRange(_eventQueue.PeekEventsForTick(tick));
+            }
+
+            return results;
+        }
+
+        #endregion
+
+        #region Public Metrics API (Thread-Safe Reads)
+
+        /// <summary>
+        /// Captures and returns a snapshot of the current world state.
+        /// </summary>
+        /// <param name="includeSynapses">If true, detailed synapse data will be included, which can be resource-intensive.</param>
+        /// <returns>A <see cref="WorldSnapshot"/> of the current state.</returns>
+        public WorldSnapshot GetWorldSnapshot(bool includeSynapses = false)
+        {
+            lock (_worldApiLock)
+            {
+                return BuildWorldSnapshot(includeSynapses);
+            }
+        }
+
+        /// <summary>
+        /// Computes and returns summary metrics for the current world state.
+        /// </summary>
+        /// <returns>A <see cref="TickMetrics"/> object with aggregated data.</returns>
+        public TickMetrics GetTickMetrics()
+        {
+            lock (_worldApiLock)
+            {
+                return ComputeTickMetrics();
+            }
+        }
+
+        /// <summary>
+        /// Retrieves a list of recent world snapshots from the metrics ring buffer.
+        /// </summary>
+        /// <param name="maxCount">The maximum number of snapshots to retrieve.</param>
+        /// <returns>A list of the most recent snapshots, ordered from most recent to oldest.</returns>
+        public IReadOnlyList<WorldSnapshot> GetRecentSnapshots(int maxCount = 256)
+        {
+            lock (_worldApiLock)
+            {
+                if (!Config.MetricsEnabled || _metricsRing == null || Config.MetricsRingCapacity <= 0 || (_metricsHead == 0 && !_metricsWrapped)) 
+                    return Array.Empty<WorldSnapshot>();
+
+                var results = new List<WorldSnapshot>(Math.Min(maxCount, Config.MetricsRingCapacity));
+                int total = _metricsWrapped ? Config.MetricsRingCapacity : _metricsHead;
+                int toTake = Math.Min(maxCount, total);
+
+                for (int i = 0; i < toTake; i++)
+                {
+                    int idx = (_metricsHead - 1 - i + Config.MetricsRingCapacity) % Config.MetricsRingCapacity;
+                    if (_metricsRing[idx] != null)
+                    {
+                        results.Add(_metricsRing[idx]);
+                    }
+                }
+                return results;
+            }
+        }
+
+        /// <summary>
+        /// Exports recent world snapshots to a JSON formatted string.
+        /// </summary>
+        /// <param name="maxCount">The maximum number of snapshots to include.</param>
+        /// <returns>A JSON string representing an array of snapshots.</returns>
+        public string ExportRecentSnapshotsToJson(int maxCount = 256)
+        {
+            var snaps = GetRecentSnapshots(maxCount);
+            return JsonConvert.SerializeObject(snaps, Formatting.Indented);
+        }
+
+        /// <summary>
+        /// Exports the summary metrics from recent snapshots to a CSV formatted string.
+        /// </summary>
+        /// <param name="maxCount">The maximum number of snapshots to include.</param>
+        /// <returns>A CSV string of the time-series metrics data.</returns>
+        public string ExportRecentTickMetricsCsv(int maxCount = 4096)
+        {
+            var snaps = GetRecentSnapshots(maxCount).OrderBy(s => s.Tick).ToList();
+            if (!snaps.Any()) return "";
+
+            var sb = new StringBuilder();
+            sb.AppendLine("tick,neuronCount,activeNeuronCount,synapseCount,activeSynapseCount,meanFiringRate,meanHealth,meanSoma,meanDend");
+
+            foreach (var s in snaps)
+            {
+                var m = s.Summary;
+                sb.AppendLine($"{m.Tick},{m.NeuronCount},{m.ActiveNeuronCount},{m.SynapseCount},{m.ActiveSynapseCount},{m.MeanFiringRate},{m.MeanHealth},{m.MeanSomaPotential},{m.MeanDendriticPotential}");
+            }
+            return sb.ToString();
+        }
+
+        #endregion
+
+        #region Public State Modifiers (Thread-Safe Writes)
+
+        /// <summary>
+        /// Creates and adds a new neuron to the world.
+        /// </summary>
+        /// <param name="position">The initial position of the neuron in 3D space.</param>
+        /// <returns>The newly created and fully initialized neuron.</returns>
+        public Neuron AddNeuron(Vector3 position)
+        {
+            var newNeuron = new Neuron
+            {
+                Id = (ulong)Interlocked.Increment(ref _nextNeuronId),
+                IsActive = true,
+                Position = position,
+                LocalVariables = new float[LVAR_COUNT],
+                Brain = new DummyBrain()
+            };
+            
+            newNeuron.LocalVariables[(int)LVarIndex.FiringThreshold] = Config.DefaultFiringThreshold;
+            newNeuron.LocalVariables[(int)LVarIndex.DecayRate] = Config.DefaultDecayRate;
+            newNeuron.LocalVariables[(int)LVarIndex.SomaPotential] = Config.InitialPotential;
+            newNeuron.LocalVariables[(int)LVarIndex.Health] = Config.InitialNeuronHealth;
+            newNeuron.LocalVariables[(int)LVarIndex.RefractoryPeriod] = Config.DefaultRefractoryPeriod;
+            newNeuron.LocalVariables[(int)LVarIndex.ThresholdAdaptationFactor] = Config.DefaultThresholdAdaptationFactor;
+            newNeuron.LocalVariables[(int)LVarIndex.ThresholdRecoveryRate] = Config.DefaultThresholdRecoveryRate;
+            newNeuron.LocalVariables[(int)LVarIndex.GeneExecutionFuel] = Config.DefaultGeneFuel;
+
+            newNeuron.Brain.SetPrng(_rng);
+
+            lock (_worldApiLock)
+            {
+                _neurons.Add(newNeuron.Id, newNeuron);
+
+                var eventId = (ulong)Interlocked.Increment(ref _nextEventId);
+                var newEvent = new Event { 
+                    Id = eventId, 
+                    Type = EventType.ExecuteGene, 
+                    TargetId = newNeuron.Id, 
+                    ExecutionTick = CurrentTick + 1, 
+                    Payload = new EventPayload{ GeneId = SYS_GENE_GESTATION }
+                };
+                _eventQueue.Push(newEvent);
+                Log("EVENT_QUEUE", LogLevel.Debug, $"Pushed event {newEvent.Type} for target {newEvent.TargetId} at tick {newEvent.ExecutionTick}.");
+                
+                _topologicallySortedNeurons = null;
+                _spatialHash.Insert(newNeuron);
+            }
+
+            return newNeuron;
+        }
+
+        /// <summary>
+        /// Creates a new synapse between any two valid entities (Neuron, InputNode, OutputNode).
+        /// </summary>
+        /// <param name="sourceId">The unique ID of the source entity (Neuron or InputNode).</param>
+        /// <param name="targetId">The unique ID of the target entity (Neuron or OutputNode).</param>
+        /// <param name="signalType">The behavioral type of the synapse's signal transmission.</param>
+        /// <param name="weight">The connection strength, modulating the signal's magnitude.</param>
+        /// <param name="parameter">A multi-purpose parameter (e.g., threshold for inputs, delay for pulses).</param>
+        /// <returns>The newly created synapse, or null if the source or target IDs are invalid.</returns>
+        public Synapse? AddSynapse(ulong sourceId, ulong targetId, SignalType signalType, float weight, float parameter)
+        {
+            lock (_worldApiLock)
+            {
+                bool sourceExists = _neurons.ContainsKey(sourceId) || _inputNodes.ContainsKey(sourceId);
+                bool targetExists = _neurons.ContainsKey(targetId) || _outputNodes.ContainsKey(targetId);
+
+                if (!sourceExists || !targetExists)
+                {
+                    Log("SIM_CORE", LogLevel.Warning, $"AddSynapse failed: Source ({sourceId}) or Target ({targetId}) does not exist.");
+                    return null;
+                }
+
+                var synapse = new Synapse
+                {
+                    Id = (ulong)Interlocked.Increment(ref _nextSynapseId),
+                    SourceId = sourceId,
+                    TargetId = targetId,
+                    SignalType = signalType,
+                    Weight = weight,
+                    Parameter = parameter,
+                    IsActive = true
+                };
+            
+                return AddSynapseInternal(synapse);
+            }
+        }
+
+        /// <summary>
+        /// Adds a new global input node to the world.
+        /// </summary>
+        /// <param name="id">The unique identifier for the new input node.</param>
+        /// <param name="initialValue">The starting value for the input node.</param>
+        public void AddInputNode(ulong id, float initialValue = 0f)
+        {
+            lock (_worldApiLock)
+            {
+                if (_inputNodes.TryAdd(id, new InputNode { Id = id, Value = initialValue }))
+                {
+                    _topologicallySortedNeurons = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Adds a new global output node to the world.
+        /// </summary>
+        /// <param name="id">The unique identifier for the new output node.</param>
+        public void AddOutputNode(ulong id)
+        {
+            lock (_worldApiLock)
+            {
+                _outputNodes.TryAdd(id, new OutputNode { Id = id, Value = 0f });
+            }
+        }
+        
+        /// <summary>
+        /// Removes a global input node and all its outgoing synapses from the world.
+        /// </summary>
+        /// <param name="id">The ID of the input node to remove.</param>
+        /// <returns>True if the node was found and removed, false otherwise.</returns>
+        public bool RemoveInputNode(ulong id)
+        {
+            lock (_worldApiLock)
+            {
+                if (!_inputNodes.Remove(id)) return false;
+                
+                var synapsesToRemove = _synapses.Where(s => s.SourceId == id).ToList();
+                foreach (var synapse in synapsesToRemove)
+                {
+                    RemoveSynapseInternal(synapse);
+                }
+                _topologicallySortedNeurons = null;
+            }
+            return true;
+        }
+        
+        /// <summary>
+        /// Removes a global output node and all its incoming synapses from the world.
+        /// </summary>
+        /// <param name="id">The ID of the output node to remove.</param>
+        /// <returns>True if the node was found and removed, false otherwise.</returns>
+        public bool RemoveOutputNode(ulong id)
+        {
+            lock (_worldApiLock)
+            {
+                if (!_outputNodes.Remove(id)) return false;
+
+                var synapsesToRemove = _synapses.Where(s => s.TargetId == id).ToList();
+                foreach (var synapse in synapsesToRemove)
+                {
+                    RemoveSynapseInternal(synapse);
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Sets the values of multiple input nodes at once.
+        /// </summary>
+        /// <param name="values">A dictionary mapping input node IDs to their new values.</param>
+        public void SetInputValues(Dictionary<ulong, float> values)
+        {
+            lock (_worldApiLock)
+            {
+                foreach (var (key, value) in values)
+                {
+                    if (_inputNodes.TryGetValue(key, out var node))
+                    {
+                        node.Value = value;
+                    }
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Sets the values of multiple global hormones at once.
+        /// </summary>
+        /// <param name="values">A dictionary mapping hormone indices to their new values.</param>
+        public void SetGlobalHormones(Dictionary<int, float> values)
+        {
+            lock (_worldApiLock)
+            {
+                foreach (var(index, value) in values)
+                {
+                    if (index >= 0 && index < GlobalHormones.Length)
+                    {
+                        GlobalHormones[index] = value;
+                    }
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Sets the values of multiple local variables for a specific neuron.
+        /// Only user-writable LVars can be modified.
+        /// </summary>
+        /// <param name="neuronId">The ID of the target neuron.</param>
+        /// <param name="values">A dictionary mapping LVar indices to their new values.</param>
+        public void SetLocalVariables(ulong neuronId, Dictionary<int, float> values)
+        {
+            lock (_worldApiLock)
+            {
+                if (!_neurons.TryGetValue(neuronId, out var neuron)) return;
+
+                foreach (var(index, value) in values)
+                {
+                    if (index >= 0 && index < (int)LVarIndex.RefractoryTimeLeft)
+                    {
+                        if (index < neuron.LocalVariables.Length)
+                        {
+                            neuron.LocalVariables[index] = value;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Adds a neuron to the deactivation queue to be processed at the end of the current tick.
+        /// </summary>
+        /// <param name="neuron">The neuron to mark for deactivation.</param>
+        public void MarkNeuronForDeactivation(Neuron neuron)
+        {
+            lock (_worldApiLock)
+            {
+                if (neuron.IsActive && !_neuronsToDeactivate.Contains(neuron))
+                {
+                    _neuronsToDeactivate.Add(neuron);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Handles the biological process of mitosis: copying a neuron and scheduling the Mitosis gene
+        /// for both parent and child.
+        /// </summary>
+        /// <param name="parent">The neuron to copy.</param>
+        /// <param name="offset">The position offset for the new child neuron relative to the parent.</param>
+        /// <returns>The newly created child neuron.</returns>
+        public Neuron PerformMitosis(Neuron parent, Vector3 offset)
+        {
+            var childNeuron = new Neuron
+            {
+                Id = (ulong)Interlocked.Increment(ref _nextNeuronId),
+                IsActive = true,
+                Position = parent.Position + offset,
+                LocalVariables = (float[])parent.LocalVariables.Clone(),
+                Brain = parent.Brain 
+            };
+            
+            childNeuron.Brain.SetPrng(_rng);
+            childNeuron.LocalVariables[(int)LVarIndex.Age] = 0;
+
+            lock (_worldApiLock)
+            {
+                _neurons.Add(childNeuron.Id, childNeuron);
+
+                var parentEventId = (ulong)Interlocked.Increment(ref _nextEventId);
+                var parentEvent = new Event { Id = parentEventId, Type = EventType.ExecuteGene, TargetId = parent.Id, ExecutionTick = CurrentTick + 1, Payload = new EventPayload{ GeneId = SYS_GENE_MITOSIS } };
+                _eventQueue.Push(parentEvent);
+
+                var childEventId = (ulong)Interlocked.Increment(ref _nextEventId);
+                var childEvent = new Event { Id = childEventId, Type = EventType.ExecuteGene, TargetId = childNeuron.Id, ExecutionTick = CurrentTick + 1, Payload = new EventPayload{ GeneId = SYS_GENE_MITOSIS } };
+                _eventQueue.Push(childEvent);
+                
+                _topologicallySortedNeurons = null;
+                _spatialHash.Insert(childNeuron);
+            }
+
+            return childNeuron;
+        }
+
+        /// <summary>
+        /// Removes a neuron and all its associated synapses from the world.
+        /// </summary>
+        /// <param name="id">The ID of the neuron to remove.</param>
+        /// <returns>True if the neuron was found and removed, false otherwise.</returns>
+        public bool RemoveNeuron(ulong id)
+        {
+            lock (_worldApiLock)
+            {
+                if (!_neurons.Remove(id, out var neuronToRemove))
+                {
+                    return false;
+                }
+
+                RebuildSpatialHash(); 
+
+                var synapsesToRemove = _synapses.Where(s => s.SourceId == id || s.TargetId == id).ToList();
+                foreach (var synapse in synapsesToRemove)
+                {
+                    RemoveSynapseInternal(synapse);
+                }
+
+                _topologicallySortedNeurons = null;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Removes a synapse from the world.
+        /// </summary>
+        /// <param name="id">The ID of the synapse to remove.</param>
+        /// <returns>True if the synapse was found and removed, false otherwise.</returns>
+        public bool RemoveSynapse(ulong id)
+        {
+            lock (_worldApiLock)
+            {
+                var synapseToRemove = _synapses.FirstOrDefault(s => s.Id == id);
+                if (synapseToRemove == null)
+                {
+                    return false;
+                }
+
+                RemoveSynapseInternal(synapseToRemove);
+                _topologicallySortedNeurons = null;
+            }
+            return true;
+        }
+        
+        #endregion
+        
+        #region Public Simulation Control
+
+        /// <summary>
+        /// Applies a set of input values and then advances the simulation by one tick.
+        /// </summary>
+        /// <param name="inputs">A dictionary mapping input node IDs to their new values.</param>
+        public void ApplyInputsAndStep(Dictionary<ulong, float> inputs)
+        {
+            SetInputValues(inputs);
+            Step();
+        }
+
+        /// <summary>
+        /// Runs the simulation for a specified number of ticks.
+        /// </summary>
+        /// <param name="ticks">The number of ticks to run.</param>
+        public void RunFor(ulong ticks)
+        {
+            for (ulong i = 0; i < ticks; i++) Step();
+        }
+
+        /// <summary>
+        /// Runs the simulation continuously until a specified condition is met.
+        /// </summary>
+        /// <param name="stopCondition">A function that returns true when the simulation should stop.</param>
+        public void RunUntil(Func<HidraWorld, bool> stopCondition)
+        {
+            while (!stopCondition(this)) 
+            {
+                Step();
+            }
+        }
+        
+        #endregion
+
+        #region Private Helpers
+
+        /// <summary>
+        /// Gets a snapshot of all neuron IDs, sorted for deterministic ordering.
+        /// </summary>
+        public IReadOnlyList<ulong> GetNeuronIdsSnapshot()
+        {
+            lock (_worldApiLock)
+            {
+                return _neurons.Count == 0
+                    ? Array.Empty<ulong>()
+                    : _neurons.Keys.OrderBy(k => k).ToList();
+            }
+        }
+
+        /// <summary>
+        /// Gets a snapshot of all input node IDs, sorted for deterministic ordering.
+        /// </summary>
+        public IReadOnlyList<ulong> GetInputIdsSnapshot()
+        {
+            lock (_worldApiLock)
+            {
+                return _inputNodes.Count == 0
+                    ? Array.Empty<ulong>()
+                    : _inputNodes.Keys.OrderBy(k => k).ToList();
+            }
+        }
+
+        /// <summary>
+        /// Gets a snapshot of all output node IDs, sorted for deterministic ordering.
+        /// </summary>
+        public IReadOnlyList<ulong> GetOutputIdsSnapshot()
+        {
+            lock (_worldApiLock)
+            {
+                return _outputNodes.Count == 0
+                    ? Array.Empty<ulong>()
+                    : _outputNodes.Keys.OrderBy(k => k).ToList();
+            }
+        }
+
+        private static readonly Comparer<Synapse> SynapseIdComparer = Comparer<Synapse>.Create((a, b) => a.Id.CompareTo(b.Id));
+
+        private static void InsertOwnedSynapseSorted(List<Synapse> list, Synapse s)
+        {
+            int idx = list.BinarySearch(s, SynapseIdComparer);
+            if (idx < 0) idx = ~idx;
+            list.Insert(idx, s);
+        }
+        
+        private void RemoveSynapseInternal(Synapse synapse)
+        {
+            _synapses.Remove(synapse);
+            
+            if (_neurons.TryGetValue(synapse.SourceId, out var sourceNeuron))
+            {
+                sourceNeuron.OwnedSynapses.Remove(synapse);
+            }
+            else if (_neurons.TryGetValue(synapse.TargetId, out var targetNeuron))
+            {
+                targetNeuron.OwnedSynapses.Remove(synapse);
+            }
+        }
+
+        private Synapse AddSynapseInternal(Synapse synapse)
+        {
             float initial = 0f;
             if (_inputNodes.TryGetValue(synapse.SourceId, out var inNode))
             {
@@ -294,12 +669,10 @@ public partial class HidraWorld
             }
             else if (_neurons.TryGetValue(synapse.SourceId, out var srcNeuron))
             {
-                initial = srcNeuron.LocalVariables[(int)LVarIndex.SomaPotential]
-                        + srcNeuron.LocalVariables[(int)LVarIndex.DendriticPotential];
+                initial = srcNeuron.GetPotential();
             }
             synapse.PreviousSourceValue = initial;
 
-            // Register the synapse globally, avoiding a full sort on every add.
             bool mustResort = _synapses.Count > 0 && synapse.Id < _synapses[^1].Id;
             _synapses.Add(synapse);
             if (mustResort)
@@ -307,43 +680,20 @@ public partial class HidraWorld
                 _synapses.Sort((a, b) => a.Id.CompareTo(b.Id));
             }
 
-            // Keep denormalized per-neuron indexes sorted by Id for fast lookups.
-            if (_neurons.TryGetValue(synapse.SourceId, out var source))
+            if (_neurons.TryGetValue(synapse.SourceId, out var sourceNeuron))
             {
-                InsertOwnedSynapseSorted(source.OwnedSynapses, synapse);
+                InsertOwnedSynapseSorted(sourceNeuron.OwnedSynapses, synapse);
             }
-            if (_neurons.TryGetValue(synapse.TargetId, out var target))
+            else if (_neurons.TryGetValue(synapse.TargetId, out var targetNeuron))
             {
-                if (synapse.SourceId != synapse.TargetId) // Avoid double-add for autapses.
-                {
-                    InsertOwnedSynapseSorted(target.OwnedSynapses, synapse);
-                }
+                InsertOwnedSynapseSorted(targetNeuron.OwnedSynapses, synapse);
             }
+            
+            _topologicallySortedNeurons = null;
+            
+            return synapse;
         }
-        return synapse;
-    }
 
-    /// <summary>
-    /// Creates a simple, default brain for a new neuron.
-    /// </summary>
-    /// <returns>A new <see cref="IBrain"/> instance configured with pass-through logic.</returns>
-    /// <remarks>
-    /// This provides a minimal, functional brain for every new neuron. The default brain
-    /// simply reads its neuron's `ActivationPotential` and sets it as the brain's primary output value.
-    /// This "pass-through" behavior is the simplest possible action and serves as a baseline.
-    /// </remarks>
-    private IBrain CreateDefaultBrain()
-    {
-        var brain = new NeuralNetworkBrain();
-        var internalNetwork = brain.GetInternalNetwork();
-
-        var input = new NNNode(0, NNNodeType.Input) { InputSource = InputSourceType.ActivationPotential };
-        var output = new NNNode(1, NNNodeType.Output) { ActionType = OutputActionType.SetOutputValue };
-        
-        internalNetwork.AddNode(input);
-        internalNetwork.AddNode(output);
-        internalNetwork.AddConnection(new NNConnection(input.Id, output.Id, 1.0f));
-
-        return brain;
+        #endregion
     }
 }

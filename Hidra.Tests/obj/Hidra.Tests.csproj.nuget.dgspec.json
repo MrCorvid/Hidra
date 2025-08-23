@@ -4,6 +4,88 @@
     "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Tests\\Hidra.Tests.csproj": {}
   },
   "projects": {
+    "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Api\\Hidra.Api.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Api\\Hidra.Api.csproj",
+        "projectName": "Hidra.Api",
+        "projectPath": "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Api\\Hidra.Api.csproj",
+        "packagesPath": "C:\\Users\\MrCorvid\\.nuget\\packages\\",
+        "outputPath": "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Api\\obj\\",
+        "projectStyle": "PackageReference",
+        "fallbackFolders": [
+          "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
+        ],
+        "configFilePaths": [
+          "C:\\Users\\MrCorvid\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {
+              "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Core\\Hidra.Core.csproj": {
+                "projectPath": "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Core\\Hidra.Core.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "9.0.200"
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "dependencies": {
+            "Microsoft.AspNetCore.Mvc.NewtonsoftJson": {
+              "target": "Package",
+              "version": "[8.0.0, )"
+            },
+            "Swashbuckle.AspNetCore": {
+              "target": "Package",
+              "version": "[6.4.0, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.AspNetCore.App": {
+              "privateAssets": "none"
+            },
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\9.0.200/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
     "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Core\\Hidra.Core.csproj": {
       "version": "1.0.0",
       "restore": {
@@ -107,6 +189,9 @@
           "net8.0": {
             "targetAlias": "net8.0",
             "projectReferences": {
+              "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Api\\Hidra.Api.csproj": {
+                "projectPath": "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Api\\Hidra.Api.csproj"
+              },
               "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Core\\Hidra.Core.csproj": {
                 "projectPath": "D:\\Projects\\HiDRA-git\\Hidra\\Hidra.Core\\Hidra.Core.csproj"
               },
@@ -140,9 +225,21 @@
               "target": "Package",
               "version": "[3.1.1, )"
             },
+            "Microsoft.AspNetCore.Mvc.Testing": {
+              "target": "Package",
+              "version": "[8.0.0, )"
+            },
             "Microsoft.NET.Test.Sdk": {
               "target": "Package",
               "version": "[17.8.0, )"
+            },
+            "Newtonsoft.Json": {
+              "target": "Package",
+              "version": "[13.0.3, )"
+            },
+            "System.Net.Http.Json": {
+              "target": "Package",
+              "version": "[8.0.0, )"
             },
             "coverlet.collector": {
               "target": "Package",

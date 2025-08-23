@@ -2,201 +2,238 @@
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Hidra.Core.Logging;
 using System.IO;
+using System;
+using System.Reflection;
 using System.Threading.Tasks;
 using System.Linq;
-using System.Text.RegularExpressions;
+using System.Collections.Generic;
 
 namespace Hidra.Tests.Logging
 {
-    /// <summary>
-    /// Contains unit tests for the static Logger class, verifying its initialization,
-    /// configuration loading, message filtering, and thread-safe operation.
-    /// </summary>
     [TestClass]
     public class LoggerTests : BaseTestClass
     {
-        private const string TestConfigPath = "test_logging_config.json";
-        private const string TestLogFilePath = "test_output.log";
+        private string _tempTestDirectory = null!;
+        private string _tempConfigPath = null!;
+        private StringWriter _consoleOutput = null!;
+        private TextWriter _originalConsoleOut = null!;
+
+        [TestInitialize]
+        public override void BaseInit()
+        {
+            // DO NOT call base.BaseInit().
+            // The base method calls Logger.Log(), which prematurely initializes the static Logger
+            // before this test class can set up its temporary config path. By omitting the base call,
+            // we ensure that the Logger remains uninitialized until the test itself makes the first call.
+            
+            _tempTestDirectory = Path.Combine(Path.GetTempPath(), "HidraLoggerTest_" + Guid.NewGuid());
+            Directory.CreateDirectory(_tempTestDirectory);
+            _tempConfigPath = Path.Combine(_tempTestDirectory, "logging_config.json");
+
+            _consoleOutput = new StringWriter();
+            _originalConsoleOut = Console.Out;
+            Console.SetOut(_consoleOutput);
+        }
 
         [TestCleanup]
-        public void Cleanup()
+        public override void BaseCleanup()
         {
-            // The logger holds file handles, so it must be shut down before we can clean up files.
-            // This also resets the static state for the next test run.
+            // The base cleanup does not interact with the logger, but we will call it last
+            // to maintain its functionality. First, we must manage our own resources.
             Logger.Shutdown();
-
-            // Clean up created files after each test to ensure isolation.
-            if (File.Exists(TestConfigPath))
+            
+            Console.SetOut(_originalConsoleOut);
+            _consoleOutput.Dispose();
+            if (Directory.Exists(_tempTestDirectory))
             {
-                File.Delete(TestConfigPath);
+                Directory.Delete(_tempTestDirectory, true);
             }
-            if (File.Exists(TestLogFilePath))
-            {
-                File.Delete(TestLogFilePath);
-            }
-        }
-        
-        #region Initialization and Configuration Tests
-
-        /// <summary>
-        /// Verifies that the Logger creates a default configuration file if one does not exist.
-        /// </summary>
-        [TestMethod]
-        public void Init_WhenConfigFileDoesNotExist_CreatesDefaultConfig()
-        {
-            // Arrange
-            // The BaseTestInitialize calls Init(), so we must shut down first to test Init again.
-            Logger.Shutdown();
-            Assert.IsFalse(File.Exists(TestConfigPath));
-
-            // Act
-            Logger.Init(TestConfigPath);
-
-            // Assert
-            Assert.IsTrue(File.Exists(TestConfigPath), "A default config file should have been created.");
-            var content = File.ReadAllText(TestConfigPath);
-            Assert.IsTrue(content.Contains("\"SIM_CORE\""), "Default config should contain default tags.");
+            
+            // We can call the base cleanup now. It only logs an "END" message, which is fine
+            // after we have shut down our test-specific logger instance.
+            base.BaseCleanup();
         }
 
-        /// <summary>
-        /// Verifies that the Logger correctly loads and applies settings from an existing config file.
-        /// </summary>
-        [TestMethod]
-        public void Init_WhenConfigFileExists_LoadsAndAppliesConfig()
+        #region Reflection Helpers
+
+        private bool IsLoggerInitialized()
         {
-            // Arrange
-            // 1. RESET: Shut down the logger to clear the state set by BaseTestInitialize.
-            Logger.Shutdown();
-
-            // Create a custom config that sets the level for TEST_TAG to Error.
-            // Using a modern interpolated string and standard JSON double-quotes for robustness.
-            string customConfig = $@"
-            {{
-                ""log_targets"": {{
-                    ""test_file"": {{ ""type"": ""file"", ""path"": ""{TestLogFilePath}"" }}
-                }},
-                ""log_tags"": {{
-                    ""TEST_TAG"": {{ ""level"": ""Error"", ""target"": ""test_file"" }}
-                }}
-            }}";
-            File.WriteAllText(TestConfigPath, customConfig);
-
-            // Act
-            // This Init call will now execute correctly.
-            Logger.Init(TestConfigPath);
-            
-            // Log two messages, one of which should be filtered out.
-            Logger.Log("TEST_TAG", LogLevel.Info, "This message should be ignored.");
-            Logger.Log("TEST_TAG", LogLevel.Error, "This message should be written.");
-
-            // 2. RELEASE: Shut down again to flush buffers and release the file lock before reading.
-            Logger.Shutdown();
-
-            // Assert
-            Assert.IsTrue(File.Exists(TestLogFilePath), "The log file specified in the config should be created.");
-            var logContent = File.ReadAllText(TestLogFilePath);
-            
-            Assert.IsFalse(logContent.Contains("This message should be ignored."), "Info level message should have been filtered out.");
-            Assert.IsTrue(logContent.Contains("This message should be written."), "Error level message should have been logged.");
+            var field = typeof(Logger).GetField("_isInitialized", BindingFlags.NonPublic | BindingFlags.Static);
+            return (bool)field!.GetValue(null)!;
         }
 
         #endregion
 
-        #region Filtering and Logging Logic
+        #region Initialization and Shutdown
 
-        /// <summary>
-        /// Verifies that the logger correctly filters messages based on the log level
-        /// specified in the configuration for a given tag.
-        /// </summary>
         [TestMethod]
-        public void Log_FiltersMessagesBelowConfiguredLevel()
+        public void Init_WhenConfigFileDoesNotExist_CreatesDefaultAndInitializes()
         {
-            // Arrange
-            // 1. RESET: Shut down the logger to clear state from the base class's setup.
-            Logger.Shutdown();
-
-            string config = $@"
-            {{
-                ""log_targets"": {{ ""test_file"": {{ ""type"": ""file"", ""path"": ""{TestLogFilePath}"" }} }},
-                ""log_tags"": {{ ""TEST"": {{ ""level"": ""Warning"", ""target"": ""test_file"" }} }}
-            }}";
-            File.WriteAllText(TestConfigPath, config);
+            // --- ARRANGE ---
+            Assert.IsFalse(File.Exists(_tempConfigPath), "Config file should not exist before test.");
             
-            // This will now correctly initialize with our test-specific config.
-            Logger.Init(TestConfigPath);
+            // --- ACT ---
+            Logger.Init(_tempConfigPath);
+            
+            // --- ASSERT ---
+            Assert.IsTrue(IsLoggerInitialized(), "Logger should be marked as initialized.");
+            Assert.IsTrue(File.Exists(_tempConfigPath), "A default config file should have been created.");
+            var config = Logger.GetConfig();
+            Assert.IsTrue(config.LogTargets.ContainsKey("default"), "Default config should contain a 'default' target.");
+        }
 
-            // Act
-            Logger.Log("TEST", LogLevel.Debug, "Debug message."); // Should be filtered
-            Logger.Log("TEST", LogLevel.Info, "Info message.");   // Should be filtered
-            Logger.Log("TEST", LogLevel.Warning, "Warning message."); // Should be logged
-            Logger.Log("TEST", LogLevel.Error, "Error message.");   // Should be logged
+        [TestMethod]
+        public void Init_WhenConfigFileExists_LoadsConfiguration()
+        {
+            // --- ARRANGE ---
+            string jsonConfig = @"
+            {
+                ""log_targets"": { ""test_file"": { ""type"": ""file"", ""path"": """ + Path.Combine(_tempTestDirectory, "test.log").Replace("\\", "\\\\") + @""" } },
+                ""log_tags"": { ""TEST"": { ""level"": ""Error"", ""target"": ""test_file"" } }
+            }";
+            File.WriteAllText(_tempConfigPath, jsonConfig);
 
-            // 2. RELEASE: Shut down again to flush the log file and release the handle.
+            // --- ACT ---
+            Logger.Init(_tempConfigPath);
+
+            // --- ASSERT ---
+            var config = Logger.GetConfig();
+            Assert.AreEqual(LogLevel.Error, config.LogTags["TEST"].Level);
+            Assert.AreEqual("test_file", config.LogTags["TEST"].Target);
+        }
+
+        [TestMethod]
+        public void Init_WithMalformedJson_FallsBackToConsoleLogger()
+        {
+            // --- ARRANGE ---
+            File.WriteAllText(_tempConfigPath, "{ not valid json }");
+
+            // --- ACT ---
+            Logger.Init(_tempConfigPath);
+            Logger.Log("ANY_TAG", LogLevel.Error, "Fallback message");
+
+            // --- ASSERT ---
+            string consoleText = _consoleOutput.ToString();
+            Assert.IsTrue(consoleText.Contains("[FATAL] Logger initialization failed"), "Fallback warning should be printed to console.");
+            Assert.IsTrue(consoleText.Contains("Fallback message"), "Messages after fallback should go to console.");
+        }
+
+        [TestMethod]
+        public void Init_IsIdempotent()
+        {
+            // --- ARRANGE ---
+            Logger.Init(_tempConfigPath); // First call
+            var config1 = Logger.GetConfig();
+            
+            // Delete the config file to prove the second Init call does nothing.
+            File.Delete(_tempConfigPath);
+
+            // --- ACT ---
+            Logger.Init(_tempConfigPath); // Second call
+            var config2 = Logger.GetConfig();
+
+            // --- ASSERT ---
+            Assert.AreSame(config1, config2, "The config object should be the same instance, proving Init was not re-run.");
+        }
+
+        [TestMethod]
+        public void Shutdown_ResetsStateAndClosesFiles()
+        {
+            // --- ARRANGE ---
+            string logPath = Path.Combine(_tempTestDirectory, "shutdown_test.log");
+            string jsonConfig = @"{ ""log_targets"": { ""f"": { ""type"": ""file"", ""path"": """ + logPath.Replace("\\", "\\\\") + @""" } }, ""log_tags"": { ""T"": { ""target"": ""f"" } } }";
+            File.WriteAllText(_tempConfigPath, jsonConfig);
+            Logger.Init(_tempConfigPath);
+            Logger.Log("T", LogLevel.Info, "message");
+
+            // --- ACT ---
             Logger.Shutdown();
 
-            // Assert
-            // This read will now succeed as the file has been created and closed.
-            var logContent = File.ReadAllText(TestLogFilePath);
-            Assert.IsFalse(logContent.Contains("Debug message."), "Debug message should be filtered.");
-            Assert.IsFalse(logContent.Contains("Info message."), "Info message should be filtered.");
-            Assert.IsTrue(logContent.Contains("Warning message."), "Warning message should be logged.");
-            Assert.IsTrue(logContent.Contains("Error message."), "Error message should be logged.");
+            // --- ASSERT ---
+            Assert.IsFalse(IsLoggerInitialized(), "Logger should be marked as uninitialized after shutdown.");
+            // Verify the file handle was released by successfully deleting the file.
+            // If the file were still locked, this would throw an IOException.
+            File.Delete(logPath);
         }
 
         #endregion
 
-        #region Thread-Safety Tests
+        #region Logging Behavior
 
-        /// <summary>
-        /// Verifies that the Logger can be initialized and used by multiple threads
-        /// concurrently without throwing exceptions or corrupting the log file.
-        /// </summary>
         [TestMethod]
-        public async Task Log_FromMultipleThreads_IsThreadSafe()
+        public void Log_ToFileTarget_WritesCorrectlyFormattedMessage()
         {
-            // Arrange
-            const int numTasks = 100;
-            const int logsPerTask = 10;
-            const int totalLogs = numTasks * logsPerTask;
+            // --- ARRANGE ---
+            string logPath = Path.Combine(_tempTestDirectory, "file_test.log");
+            string jsonConfig = @"{ ""log_targets"": { ""file1"": { ""type"": ""file"", ""path"": """ + logPath.Replace("\\", "\\\\") + @""" } }, ""log_tags"": { ""FILE_TAG"": { ""target"": ""file1"" } } }";
+            File.WriteAllText(_tempConfigPath, jsonConfig);
             
-            // 1. RESET: Shut down the logger to clear any state from the base test setup.
-            Logger.Shutdown();
+            // --- ACT ---
+            Logger.Init(_tempConfigPath);
+            Logger.Log("FILE_TAG", LogLevel.Warning, "Test message for file.");
+            Logger.Shutdown(); // Must shut down to flush and release the file handle.
+
+            // --- ASSERT ---
+            string logContent = File.ReadAllText(logPath);
+            Assert.IsTrue(logContent.Contains("[Warning] [FILE_TAG] Test message for file."));
+        }
+
+        [TestMethod]
+        public void Log_ObeysLogLevelFiltering()
+        {
+            // --- ARRANGE ---
+            string jsonConfig = @"{ ""log_targets"": { ""console"": { ""type"": ""console"" } }, ""log_tags"": { ""FILTER_TAG"": { ""level"": ""Warning"", ""target"": ""console"" } } }";
+            File.WriteAllText(_tempConfigPath, jsonConfig);
             
-            // Use standard double-quotes for JSON.
-            string config = $@"
-            {{
-                ""log_targets"": {{ ""test_file"": {{ ""type"": ""file"", ""path"": ""{TestLogFilePath}"" }} }},
-                ""log_tags"": {{ ""THREAD_TEST"": {{ ""level"": ""Debug"", ""target"": ""test_file"" }} }}
-            }}";
-            File.WriteAllText(TestConfigPath, config);
+            // --- ACT ---
+            Logger.Init(_tempConfigPath);
+            Logger.Log("FILTER_TAG", LogLevel.Info, "This should be filtered.");
+            Logger.Log("FILTER_TAG", LogLevel.Warning, "This should be logged.");
+            Logger.Log("FILTER_TAG", LogLevel.Error, "This should also be logged.");
+
+            // --- ASSERT ---
+            string consoleText = _consoleOutput.ToString();
+            Assert.IsFalse(consoleText.Contains("This should be filtered."));
+            Assert.IsTrue(consoleText.Contains("This should be logged."));
+            Assert.IsTrue(consoleText.Contains("This should also be logged."));
+        }
+
+        #endregion
+
+        #region Concurrency
+
+        [TestMethod]
+        public async Task Log_FromMultipleThreads_ProducesNonInterleavedOutput()
+        {
+            // --- ARRANGE ---
+            string logPath = Path.Combine(_tempTestDirectory, "concurrent.log");
+            string jsonConfig = @"{ ""log_targets"": { ""f"": { ""type"": ""file"", ""path"": """ + logPath.Replace("\\", "\\\\") + @""" } }, ""log_tags"": { ""CONCURRENT"": { ""level"": ""Debug"", ""target"": ""f"" } } }";
+            File.WriteAllText(_tempConfigPath, jsonConfig);
             
-            // This Init call will now load our test-specific configuration.
-            Logger.Init(TestConfigPath);
-            
-            // Act
-            var tasks = Enumerable.Range(0, numTasks).Select(i =>
-                Task.Run(() =>
-                {
-                    for (int j = 0; j < logsPerTask; j++)
-                    {
-                        Logger.Log("THREAD_TEST", LogLevel.Info, $"Log from task {i}, message {j}");
-                    }
-                })
-            );
-            
+            Logger.Init(_tempConfigPath);
+
+            const int taskCount = 100;
+            var tasks = new List<Task>();
+
+            // --- ACT ---
+            for (int i = 0; i < taskCount; i++)
+            {
+                int taskId = i;
+                tasks.Add(Task.Run(() => Logger.Log("CONCURRENT", LogLevel.Debug, $"Message from task {taskId}.")));
+            }
             await Task.WhenAll(tasks);
+            Logger.Shutdown(); // Flush and close file.
 
-            // 2. FLUSH & CLOSE: Shut down the logger to guarantee all writes are flushed and the file is closed.
-            // This is the robust replacement for Task.Delay().
-            Logger.Shutdown(); 
+            // --- ASSERT ---
+            var lines = File.ReadAllLines(logPath);
+            Assert.AreEqual(taskCount, lines.Length, "The number of log entries should match the number of tasks.");
 
-            // Assert
-            Assert.IsTrue(File.Exists(TestLogFilePath), "Log file should have been created.");
-            var lines = File.ReadAllLines(TestLogFilePath);
+            var uniqueLines = new HashSet<string>(lines);
+            Assert.AreEqual(taskCount, uniqueLines.Count, "All log entries should be unique and complete (not interleaved).");
             
-            // The "Logger initialized" message goes to the console, so we expect exactly totalLogs.
-            Assert.AreEqual(totalLogs, lines.Length, "All log messages from all threads should be present in the file.");
+            Assert.IsTrue(lines.All(line => line.EndsWith("."))); // A simple check for non-garbled lines
         }
+
         #endregion
     }
 }

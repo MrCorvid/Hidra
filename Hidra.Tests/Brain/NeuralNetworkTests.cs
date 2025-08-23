@@ -1,188 +1,277 @@
-// Hidra.Tests/Brain/NeuralNetworkTests.cs
+// Hidra.Tests/Core/Brain/NeuralNetworkTests.cs
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Hidra.Core;
 using Hidra.Core.Brain;
+using Hidra.Core.Logging; // Keep this for LogLevel enum
 using System;
-using System.Linq;
 using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 
-namespace Hidra.Tests.Brain
+namespace Hidra.Tests.Core.Brain
 {
-    /// <summary>
-    /// Contains unit tests for the NeuralNetwork class, focusing on its internal
-    /// structure, topological sort-based evaluation, and lifecycle management.
-    /// These tests validate the network's core logic independently of its role as an IBrain.
-    /// </summary>
     [TestClass]
     public class NeuralNetworkTests : BaseTestClass
     {
-        private NeuralNetwork _nn = null!;
+        private NeuralNetwork _network = null!;
 
         [TestInitialize]
-        public void Setup()
+        public override void BaseInit()
         {
-            _nn = new NeuralNetwork();
+            base.BaseInit();
+            _network = new NeuralNetwork();
         }
 
-        #region Structure and Lifecycle Tests
+        #region Helper Methods
 
-        /// <summary>
-        /// Verifies that AddNode correctly adds a node to all relevant internal collections
-        /// and invalidates the sort cache.
-        /// </summary>
-        [TestMethod]
-        public void AddNode_WhenCalled_AddsNodeToCollectionsAndInvalidatesCache()
+        private List<NNNode>? GetSortedNodesCache(NeuralNetwork network)
         {
-            // Arrange
-            var inputNode = new NNNode(1, NNNodeType.Input);
-            var outputNode = new NNNode(2, NNNodeType.Output);
-
-            // Act
-            _nn.AddNode(inputNode);
-            _nn.AddNode(outputNode);
-
-            // Assert
-            Assert.AreEqual(2, _nn.Nodes.Count);
-            Assert.IsTrue(_nn.Nodes.ContainsKey(1));
-            Assert.AreEqual(1, _nn.InputNodes.Count);
-            Assert.AreEqual(1, _nn.OutputNodes.Count);
-        }
-
-        /// <summary>
-        /// Verifies that RemoveNode correctly removes a node and all its associated connections.
-        /// </summary>
-        [TestMethod]
-        public void RemoveNode_RemovesNodeAndAssociatedConnections()
-        {
-            // Arrange
-            var n1 = new NNNode(1, NNNodeType.Input);
-            var n2 = new NNNode(2, NNNodeType.Hidden);
-            var n3 = new NNNode(3, NNNodeType.Output);
-            _nn.AddNode(n1);
-            _nn.AddNode(n2);
-            _nn.AddNode(n3);
-            _nn.AddConnection(new NNConnection(1, 2, 1f));
-            _nn.AddConnection(new NNConnection(2, 3, 1f));
-            Assert.AreEqual(2, _nn.Connections.Count);
-
-            // Act
-            _nn.RemoveNode(2); // Remove the hidden node
-
-            // Assert
-            Assert.IsFalse(_nn.Nodes.ContainsKey(2), "Node 2 should be removed.");
-            Assert.AreEqual(0, _nn.Connections.Count, "All connections involving node 2 should be removed.");
-        }
-
-        /// <summary>
-        /// Verifies that the network can be saved to JSON and loaded back,
-        /// restoring its state and correctly rebuilding runtime caches.
-        /// </summary>
-        [TestMethod]
-        public void InitializeFromLoad_RestoresStateAndRebuildsCaches()
-        {
-            // Arrange
-            var originalNet = new NeuralNetwork();
-            originalNet.AddNode(new NNNode(1, NNNodeType.Input));
-            originalNet.AddNode(new NNNode(2, NNNodeType.Output));
-            originalNet.AddConnection(new NNConnection(1, 2, 0.5f));
-            
-            // This would normally be done via HidraWorld persistence.
-            string json = Newtonsoft.Json.JsonConvert.SerializeObject(originalNet);
-            var loadedNet = Newtonsoft.Json.JsonConvert.DeserializeObject<NeuralNetwork>(json)!;
-
-            // Act
-            loadedNet.InitializeFromLoad();
-
-            // Assert
-            Assert.AreEqual(1, loadedNet.InputNodes.Count, "Input node cache should be rebuilt.");
-            Assert.AreEqual(1, loadedNet.OutputNodes.Count, "Output node cache should be rebuilt.");
-            Assert.AreEqual(0.5f, loadedNet.Connections[0].Weight, "Connection data should be restored.");
+            var field = typeof(NeuralNetwork).GetField("_sortedNodes", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.IsNotNull(field, "Could not find private field _sortedNodes.");
+            return (List<NNNode>?)field.GetValue(network);
         }
 
         #endregion
 
-        #region Evaluation and Logic Tests
+        #region State Management Tests
 
-        /// <summary>
-        /// Tests the evaluation of a simple two-input, one-output network.
-        /// </summary>
         [TestMethod]
-        public void Evaluate_SimpleFeedForward_CalculatesCorrectOutput()
+        public void AddNode_CorrectlyPopulatesCollectionsAndInvalidatesCache()
         {
-            // Arrange
-            _nn.AddNode(new NNNode(1, NNNodeType.Input));
-            _nn.AddNode(new NNNode(2, NNNodeType.Input));
-            _nn.AddNode(new NNNode(3, NNNodeType.Output) { Bias = 0.1f }); // Tanh is default
-            _nn.AddConnection(new NNConnection(1, 3, 0.5f));
-            _nn.AddConnection(new NNConnection(2, 3, 1.0f));
-            var inputs = new[] { 0.8f, 0.2f };
-            
-            // Expected: Tanh((0.8 * 0.5) + (0.2 * 1.0) + 0.1) = Tanh(0.7)
-            float expected = (float)Math.Tanh(0.7f);
+            // --- ARRANGE ---
+            var input = new NNNode(0, NNNodeType.Input);
+            var output = new NNNode(1, NNNodeType.Output);
+            _network.Evaluate(Array.Empty<float>()); // Prime the sort cache
+            Assert.IsNotNull(GetSortedNodesCache(_network), "Cache should be primed before mutation.");
 
-            // Act
-            _nn.Evaluate(inputs);
+            // --- ACT ---
+            _network.AddNode(input);
+            _network.AddNode(output);
 
-            // Assert
-            Assert.AreEqual(expected, _nn.OutputNodes[0].Value, 1e-6f);
-        }
-
-        /// <summary>
-        /// Tests a network with a hidden layer, verifying correct value propagation.
-        /// </summary>
-        [TestMethod]
-        public void Evaluate_WithHiddenLayer_CalculatesCorrectOutput()
-        {
-            // Arrange
-            _nn.AddNode(new NNNode(1, NNNodeType.Input));
-            _nn.AddNode(new NNNode(2, NNNodeType.Hidden) { Bias = -0.2f });
-            _nn.AddNode(new NNNode(3, NNNodeType.Output) { Bias = 0.5f });
-            _nn.AddConnection(new NNConnection(1, 2, 0.8f));
-            _nn.AddConnection(new NNConnection(2, 3, 1.5f));
-            var inputs = new[] { 1.0f };
-
-            // Expected:
-            // HiddenVal = Tanh((1.0 * 0.8) + (-0.2)) = Tanh(0.6)
-            // OutputVal = Tanh((HiddenVal * 1.5) + 0.5)
-            float hiddenVal = (float)Math.Tanh(0.6f);
-            float expected = (float)Math.Tanh(hiddenVal * 1.5f + 0.5f);
-
-            // Act
-            _nn.Evaluate(inputs);
-
-            // Assert
-            Assert.AreEqual(expected, _nn.OutputNodes[0].Value, 1e-6f);
+            // --- ASSERT ---
+            Assert.AreEqual(2, _network.Nodes.Count);
+            Assert.AreEqual(1, _network.InputNodes.Count);
+            Assert.AreEqual(1, _network.OutputNodes.Count);
+            Assert.AreEqual(input.Id, _network.InputNodes[0].Id);
+            Assert.IsNull(GetSortedNodesCache(_network), "Adding a node should invalidate the sort cache.");
         }
         
-        /// <summary>
-        /// Verifies that attempting to evaluate a network with a cycle throws an InvalidOperationException.
-        /// </summary>
         [TestMethod]
-        public void Evaluate_WithCycle_ThrowsInvalidOperationException()
+        public void AddConnection_CorrectlyPopulatesCollectionsAndInvalidatesCache()
         {
-            // Arrange: 1 -> 2 -> 3 -> 1
-            _nn.AddNode(new NNNode(1, NNNodeType.Input));
-            _nn.AddNode(new NNNode(2, NNNodeType.Hidden));
-            _nn.AddNode(new NNNode(3, NNNodeType.Hidden));
-            _nn.AddConnection(new NNConnection(1, 2, 1f));
-            _nn.AddConnection(new NNConnection(2, 3, 1f));
-            _nn.AddConnection(new NNConnection(3, 1, 1f)); // Creates the cycle
-            
-            // Act & Assert
-            var ex = Assert.ThrowsException<InvalidOperationException>(() => _nn.Evaluate(new[] { 1.0f }));
-            Assert.IsTrue(ex.Message.Contains("Cycle detected"));
+            // --- ARRANGE ---
+            var node1 = new NNNode(0, NNNodeType.Input);
+            var node2 = new NNNode(1, NNNodeType.Output);
+            _network.AddNode(node1);
+            _network.AddNode(node2);
+            _network.Evaluate(new[] { 0f }); // Prime the cache
+            Assert.IsNotNull(GetSortedNodesCache(_network));
+
+            // --- ACT ---
+            _network.AddConnection(new NNConnection(0, 1, 0.5f));
+
+            // --- ASSERT ---
+            Assert.AreEqual(1, _network.Connections.Count);
+            Assert.IsNull(GetSortedNodesCache(_network), "Adding a connection should invalidate the sort cache.");
         }
 
-        /// <summary>
-        /// Verifies that providing the wrong number of inputs throws an ArgumentException.
-        /// </summary>
         [TestMethod]
-        public void Evaluate_WithMismatchedInputCount_ThrowsArgumentException()
+        public void RemoveNode_RemovesNodeAndAllAssociatedConnections()
         {
-            // Arrange
-            _nn.AddNode(new NNNode(1, NNNodeType.Input));
+            // --- ARRANGE ---
+            var n0 = new NNNode(0, NNNodeType.Input);
+            var n1 = new NNNode(1, NNNodeType.Hidden);
+            var n2 = new NNNode(2, NNNodeType.Output);
+            _network.AddNode(n0);
+            _network.AddNode(n1);
+            _network.AddNode(n2);
+            _network.AddConnection(new NNConnection(0, 1, 1f));
+            _network.AddConnection(new NNConnection(1, 2, 1f));
+            _network.AddConnection(new NNConnection(0, 2, 1f));
 
-            // Act & Assert
-            Assert.ThrowsException<ArgumentException>(() => _nn.Evaluate(new[] { 0.5f, 0.5f }));
+            // --- ACT ---
+            _network.RemoveNode(1);
+
+            // --- ASSERT ---
+            Assert.AreEqual(2, _network.Nodes.Count);
+            Assert.IsFalse(_network.Nodes.ContainsKey(1));
+            Assert.AreEqual(1, _network.Connections.Count, "Only one connection should remain.");
+            Assert.AreEqual(0, _network.Connections[0].FromNodeId);
+            Assert.AreEqual(2, _network.Connections[0].ToNodeId);
+        }
+
+        [TestMethod]
+        public void Clear_ResetsAllInternalState()
+        {
+            _network.AddNode(new NNNode(0, NNNodeType.Input));
+            _network.AddConnection(new NNConnection(0, 0, 0));
+            _network.InitializeFromLoad(); 
+
+            _network.Clear();
+
+            Assert.AreEqual(0, _network.Nodes.Count);
+            Assert.AreEqual(0, _network.Connections.Count);
+            Assert.AreEqual(0, _network.InputNodes.Count);
+            Assert.AreEqual(0, _network.OutputNodes.Count);
+            Assert.IsNull(GetSortedNodesCache(_network));
+        }
+
+        #endregion
+
+        #region Evaluation Logic
+
+        [TestMethod]
+        public void Evaluate_WithSimpleNetwork_CalculatesCorrectOutput()
+        {
+            var inputNode = new NNNode(0, NNNodeType.Input);
+            var outputNode = new NNNode(1, NNNodeType.Output) { Bias = 0.1f, ActivationFunction = ActivationFunctionType.Linear };
+            _network.AddNode(inputNode);
+            _network.AddNode(outputNode);
+            _network.AddConnection(new NNConnection(0, 1, 0.5f));
+            
+            _network.Evaluate(new[] { 10f });
+
+            AreClose(5.1f, outputNode.Value);
+        }
+        
+        [TestMethod]
+        public void Evaluate_AppliesActivationFunctionsCorrectly()
+        {
+            var input = new NNNode(0, NNNodeType.Input);
+            _network.AddNode(input);
+            var nodes = new Dictionary<ActivationFunctionType, NNNode>();
+            
+            foreach (ActivationFunctionType funcType in Enum.GetValues(typeof(ActivationFunctionType)))
+            {
+                var node = new NNNode((int)funcType + 1, NNNodeType.Hidden) { ActivationFunction = funcType };
+                nodes[funcType] = node;
+                _network.AddNode(node);
+                _network.AddConnection(new NNConnection(0, node.Id, 1.0f));
+            }
+
+            _network.Evaluate(new[] { 0.8f });
+
+            AreClose(0.8f, nodes[ActivationFunctionType.Linear].Value);
+            AreClose((float)Math.Tanh(0.8), nodes[ActivationFunctionType.Tanh].Value);
+            AreClose(1.0f / (1.0f + (float)Math.Exp(-0.8)), nodes[ActivationFunctionType.Sigmoid].Value);
+            AreClose(0.8f, nodes[ActivationFunctionType.ReLU].Value);
+        }
+
+        [TestMethod]
+        public void Evaluate_WithMultiLayerNetwork_PropagatesValuesCorrectly()
+        {
+            var n_in = new NNNode(0, NNNodeType.Input);
+            var n_h1 = new NNNode(1, NNNodeType.Hidden) { ActivationFunction = ActivationFunctionType.Linear };
+            var n_h2 = new NNNode(2, NNNodeType.Hidden) { ActivationFunction = ActivationFunctionType.Linear, Bias = 0.1f };
+            var n_out = new NNNode(3, NNNodeType.Output) { ActivationFunction = ActivationFunctionType.Linear };
+            _network.AddNode(n_in); _network.AddNode(n_h1); _network.AddNode(n_h2); _network.AddNode(n_out);
+            _network.AddConnection(new NNConnection(0, 1, 0.5f));
+            _network.AddConnection(new NNConnection(0, 2, 2.0f));
+            _network.AddConnection(new NNConnection(1, 3, 1.0f));
+            _network.AddConnection(new NNConnection(2, 3, 3.0f));
+
+            _network.Evaluate(new[] { 10f });
+
+            AreClose(65.3f, n_out.Value);
+        }
+        
+        #endregion
+
+        #region Topological Sort and Caching
+
+        [TestMethod]
+        public void Evaluate_CachesTopologicalSortOnFirstRun()
+        {
+            _network.AddNode(new NNNode(0, NNNodeType.Input));
+            Assert.IsNull(GetSortedNodesCache(_network), "Cache should be null initially.");
+            
+            _network.Evaluate(new[] { 0f });
+            var cache1 = GetSortedNodesCache(_network);
+            Assert.IsNotNull(cache1, "Cache should be populated after first evaluation.");
+
+            _network.Evaluate(new[] { 0f });
+            var cache2 = GetSortedNodesCache(_network);
+            Assert.AreSame(cache1, cache2, "Cache should be reused on subsequent evaluations.");
+        }
+
+        [TestMethod]
+        public void Evaluate_AfterMutation_RecalculatesSortCache()
+        {
+            _network.AddNode(new NNNode(0, NNNodeType.Input));
+            _network.Evaluate(new[] { 0f });
+            var oldCache = GetSortedNodesCache(_network);
+            
+            _network.AddNode(new NNNode(1, NNNodeType.Output));
+            Assert.IsNull(GetSortedNodesCache(_network), "Cache should be invalidated by AddNode.");
+
+            _network.Evaluate(new[] { 0f });
+            var newCache = GetSortedNodesCache(_network);
+            Assert.IsNotNull(newCache);
+            Assert.AreNotSame(oldCache, newCache, "A new cache should be created after mutation.");
+        }
+
+        #endregion
+
+        #region Errors and Edge Cases
+
+        [TestMethod]
+        public void Evaluate_WithMismatchedInputs_LogsErrorAndReturns()
+        {
+            var loggedMessages = new List<(LogLevel Level, string Message)>();
+            Action<string, LogLevel, string> testLogAction = (tag, level, message) =>
+            {
+                loggedMessages.Add((level, message));
+            };
+
+            _network.AddNode(new NNNode(0, NNNodeType.Input));
+            
+            _network.Evaluate(new float[] { 1f, 2f }, testLogAction);
+
+            Assert.IsTrue(loggedMessages.Any(log => log.Level == LogLevel.Error && log.Message.Contains("Mismatched input count")), "Should log an error for mismatched inputs.");
+        }
+
+        [TestMethod]
+        public void AddConnection_ToNonExistentNode_ReturnsFalseAndLogsWarning()
+        {
+            var loggedMessages = new List<(LogLevel Level, string Message)>();
+            Action<string, LogLevel, string> testLogAction = (tag, level, message) =>
+            {
+                loggedMessages.Add((level, message));
+            };
+
+            _network.AddNode(new NNNode(0, NNNodeType.Input));
+            
+            bool result = _network.AddConnection(new NNConnection(0, 99, 1f), testLogAction);
+
+            Assert.IsFalse(result, "AddConnection should return false for non-existent nodes.");
+            Assert.IsTrue(loggedMessages.Any(log => log.Level == LogLevel.Warning && log.Message.Contains("Node(s) not found")), "Should log a warning for non-existent nodes.");
+        }
+
+        [TestMethod]
+        public void Evaluate_WithCyclicNetwork_LogsError()
+        {
+            var loggedMessages = new List<(LogLevel Level, string Message)>();
+            Action<string, LogLevel, string> testLogAction = (tag, level, message) =>
+            {
+                loggedMessages.Add((level, message));
+            };
+            
+            var n1 = new NNNode(0, NNNodeType.Hidden);
+            var n2 = new NNNode(1, NNNodeType.Hidden);
+            _network.AddNode(n1);
+            _network.AddNode(n2);
+            
+            // Intentionally bypass the AddConnection cycle check for testing the sort
+            var connectionsField = typeof(NeuralNetwork).GetField("_connections", BindingFlags.NonPublic | BindingFlags.Instance);
+            var connectionsList = (List<NNConnection>)connectionsField!.GetValue(_network)!;
+            connectionsList.Add(new NNConnection(0, 1, 1f));
+            connectionsList.Add(new NNConnection(1, 0, 1f));
+            
+            _network.InitializeFromLoad(testLogAction);
+
+            _network.Evaluate(Array.Empty<float>(), testLogAction);
+            
+            Assert.IsTrue(loggedMessages.Any(log => log.Level == LogLevel.Error && log.Message.Contains("Cycle detected")), "Should log an error when a cycle is detected during evaluation.");
         }
 
         #endregion

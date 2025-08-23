@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!-- THIS IS THE NEW ITEMGROUP TO ADD -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Hidra.Tests" />
+  </ItemGroup>
+  
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="8.0.0" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- This path assumes Hidra.Core is in a parallel directory. Adjust if needed. -->
+    <ProjectReference Include="..\Hidra.Core\Hidra.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- This ensures the default genome file is copied to the output directory -->
+    <None Update="default_genome.hgl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

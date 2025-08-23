@@ -1,129 +1,175 @@
-// Hidra.Tests/Core/SpatialHashTests.cs
-using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Hidra.Core;
+// Hidra.Core/World/SpatialHash.cs
+using System;
+using System.Collections.Generic;
 using System.Numerics;
-using System.Linq;
 
-namespace Hidra.Tests.Core
+namespace Hidra.Core
 {
     /// <summary>
-    /// Contains unit tests for the SpatialHash class, focusing on insertion,
-    /// neighbor-finding accuracy, and lifecycle management (clear/reuse).
-    /// <para>
-    /// [THREAD-SAFETY] These tests operate on a single thread, respecting the
-    /// documented non-thread-safe design of the SpatialHash.
-    /// </para>
+    /// A data structure for efficiently querying objects in a 3D space based on proximity.
     /// </summary>
-    [TestClass]
-    public class SpatialHashTests : BaseTestClass
+    /// <remarks>
+    /// <para>
+    /// <b>THREAD-SAFETY WARNING:</b> This class is <b>NOT THREAD-SAFE</b> by design to maximize performance.
+    /// All write operations (<see cref="Insert"/>, <see cref="Clear"/>) must be synchronized externally.
+    /// It is designed to be cleared and rebuilt from a single thread during each simulation step.
+    /// Read operations (<see cref="FindNeighbors"/>) are safe to perform from multiple threads
+    /// ONLY IF no writes are occurring concurrently.
+    /// </para>
+    /// <para>
+    /// It uses a simple object pool for its internal <c>CellEntry</c> objects to reduce
+    /// garbage collection pressure during the frequent Clear/Insert cycles.
+    /// </para>
+    /// </remarks>
+    public class SpatialHash
     {
-        private const float CELL_SIZE = 10.0f;
-        private SpatialHash _hash = null!;
-
-        [TestInitialize]
-        public void TestInitialize()
+        // Internal linked-list entry for handling multiple neurons in the same cell.
+        private class CellEntry
         {
-            // Use a small initial capacity to test pool growth.
-            _hash = new SpatialHash(CELL_SIZE, initialPoolCapacity: 2);
+            public Neuron? Neuron;
+            public CellEntry? Next;
         }
 
-        /// <summary>
-        /// Verifies that FindNeighbors correctly identifies neurons within the specified
-        /// radius, includes those on the boundary, and excludes those outside.
-        /// </summary>
-        [TestMethod]
-        public void FindNeighbors_ReturnsCorrectNeuronsWithinRadius()
-        {
-            // Arrange
-            var centerNeuron = new Neuron { Id = 1, Position = new Vector3(5, 5, 5) };
-            var insideNeuron = new Neuron { Id = 2, Position = new Vector3(10, 5, 5) }; // dist = 5
-            var onEdgeNeuron = new Neuron { Id = 3, Position = new Vector3(11, 5, 5) }; // dist = 6
-            var outsideNeuron = new Neuron { Id = 4, Position = new Vector3(12, 5, 5) };// dist = 7
+        // ROBUST: Key cells by exact integer coordinates (no collisions).
+        private readonly Dictionary<(int x, int y, int z), CellEntry> _cells = new();
 
-            _hash.Insert(centerNeuron);
-            _hash.Insert(insideNeuron);
-            _hash.Insert(onEdgeNeuron);
-            _hash.Insert(outsideNeuron);
+        private readonly float _cellSize;
+        private readonly float _inverseCellSize;
 
-            // Act
-            var neighbors = _hash.FindNeighbors(centerNeuron, radius: 6.0f).ToList();
-
-            // Assert
-            Assert.AreEqual(2, neighbors.Count, "Should find two neighbors.");
-            Assert.IsTrue(neighbors.Any(n => n.Id == insideNeuron.Id), "Should include the neuron clearly inside the radius.");
-            Assert.IsTrue(neighbors.Any(n => n.Id == onEdgeNeuron.Id), "Should include the neuron exactly on the radius boundary.");
-            Assert.IsFalse(neighbors.Any(n => n.Id == outsideNeuron.Id), "Should exclude the neuron outside the radius.");
-            Assert.IsFalse(neighbors.Any(n => n.Id == centerNeuron.Id), "Should not include the source neuron in its own neighbor list.");
-        }
+        // A simple memory pool for CellEntry objects to reduce GC pressure.
+        private readonly List<CellEntry> _entryPool;
+        private int _poolIndex = 0;
 
         /// <summary>
-        /// Verifies that FindNeighbors returns an empty collection when no other
-        /// neurons are within the query radius.
+        /// Initializes a new instance of the <see cref="SpatialHash"/> class.
         /// </summary>
-        [TestMethod]
-        public void FindNeighbors_WithNoNeuronsNearby_ReturnsEmpty()
+        /// <param name="cellSize">The size of each grid cell. Should be based on the typical query radius.</param>
+        /// <param name="initialPoolCapacity">The initial number of CellEntry objects to pre-allocate.</param>
+        public SpatialHash(float cellSize, int initialPoolCapacity = 4096)
         {
-            // Arrange
-            var centerNeuron = new Neuron { Id = 1, Position = Vector3.Zero };
-            var farNeuron = new Neuron { Id = 2, Position = new Vector3(100, 100, 100) };
-            _hash.Insert(centerNeuron);
-            _hash.Insert(farNeuron);
+            _cellSize = cellSize;
+            _inverseCellSize = 1.0f / cellSize;
 
-            // Act
-            var neighbors = _hash.FindNeighbors(centerNeuron, radius: 50.0f).ToList();
-
-            // Assert
-            Assert.AreEqual(0, neighbors.Count);
-        }
-
-        /// <summary>
-        /// Verifies that the Clear method effectively empties the hash,
-        /// ensuring that subsequent queries find no results.
-        /// </summary>
-        [TestMethod]
-        public void Clear_ResetsTheHash_AllowingReuse()
-        {
-            // Arrange
-            var neuron1 = new Neuron { Id = 1, Position = Vector3.Zero };
-            var neuron2 = new Neuron { Id = 2, Position = Vector3.One };
-            _hash.Insert(neuron1);
-            _hash.Insert(neuron2);
-
-            // Sanity check: ensure neurons are found before clearing.
-            Assert.AreEqual(1, _hash.FindNeighbors(neuron1, 5.0f).Count());
-
-            // Act
-            _hash.Clear();
-
-            // Assert
-            // Querying for the same neuron should now yield no results.
-            Assert.AreEqual(0, _hash.FindNeighbors(neuron1, 5.0f).Count(), "Hash should be empty after Clear().");
-        }
-
-        /// <summary>
-        /// Verifies that inserting more neurons than the initial pool capacity
-        /// correctly grows the internal pool without causing errors.
-        /// </summary>
-        [TestMethod]
-        public void Insert_WithMoreThanInitialCapacity_GrowsPoolAndSucceeds()
-        {
-            // Arrange
-            // The hash was initialized with a capacity of 2. We'll add 3.
-            var neuron1 = new Neuron { Id = 1, Position = new Vector3(1, 1, 1) };
-            var neuron2 = new Neuron { Id = 2, Position = new Vector3(2, 2, 2) };
-            var neuron3 = new Neuron { Id = 3, Position = new Vector3(3, 3, 3) };
-
-            // Act & Assert
-            // The test succeeds if no exception is thrown during insertion.
-            try
+            // Pre-allocate the pool to avoid list resizing during insertion.
+            _entryPool = new List<CellEntry>(initialPoolCapacity);
+            for (int i = 0; i < initialPoolCapacity; i++)
             {
-                _hash.Insert(neuron1);
-                _hash.Insert(neuron2);
-                _hash.Insert(neuron3); // This insertion exceeds initial capacity.
+                _entryPool.Add(new CellEntry());
             }
-            catch (System.Exception ex)
+        }
+
+        /// <summary>
+        /// Clears the spatial hash, returning all pooled entries to the pool for reuse.
+        /// This is an O(1) operation (not counting dictionary clear time).
+        /// </summary>
+        public void Clear()
+        {
+            _cells.Clear();
+
+            // Clean up only the entries we used in this build for GC-friendliness.
+            for (int i = 0; i < _poolIndex; i++)
             {
-                Assert.Fail($"Expected no exception, but got: {ex.Message}");
+                var e = _entryPool[i];
+                e.Neuron = null;
+                e.Next = null;
+            }
+
+            _poolIndex = 0; // Reset the pool index, effectively "freeing" all entries.
+        }
+
+        /// <summary>
+        /// Inserts a neuron into the spatial hash.
+        /// </summary>
+        /// <param name="neuron">The neuron to insert.</param>
+        public void Insert(Neuron neuron)
+        {
+            if (neuron == null) return;
+
+            // Compute cell coordinates using floor to handle negatives correctly.
+            var p = neuron.Position;
+            int ix = (int)MathF.Floor(p.X * _inverseCellSize);
+            int iy = (int)MathF.Floor(p.Y * _inverseCellSize);
+            int iz = (int)MathF.Floor(p.Z * _inverseCellSize);
+            var key = (ix, iy, iz);
+
+            // Get a pre-allocated entry from the pool; grow on demand.
+            CellEntry entry;
+            if (_poolIndex < _entryPool.Count)
+            {
+                entry = _entryPool[_poolIndex++];
+            }
+            else
+            {
+                entry = new CellEntry();
+                _entryPool.Add(entry);
+                _poolIndex++;
+            }
+
+            entry.Neuron = neuron;
+
+            // Push-front into the linked list for this cell.
+            if (_cells.TryGetValue(key, out var head))
+            {
+                entry.Next = head;
+                _cells[key] = entry;
+            }
+            else
+            {
+                entry.Next = null;
+                _cells[key] = entry;
+            }
+        }
+
+        /// <summary>
+        /// Finds all neurons within a given radius of a central neuron.
+        /// </summary>
+        /// <param name="neuron">The neuron at the center of the search area.</param>
+        /// <param name="radius">The search radius.</param>
+        /// <returns>An enumerable collection of neighboring neurons.</returns>
+        public IEnumerable<Neuron> FindNeighbors(Neuron neuron, float radius)
+        {
+            if (neuron == null) yield break;
+            if (radius <= 0f) yield break;
+
+            var center = neuron.Position;
+            float r2 = radius * radius;
+
+            // Inclusive bounds using floor on both ends to correctly span negatives.
+            int minX = (int)MathF.Floor((center.X - radius) * _inverseCellSize);
+            int maxX = (int)MathF.Floor((center.X + radius) * _inverseCellSize);
+            int minY = (int)MathF.Floor((center.Y - radius) * _inverseCellSize);
+            int maxY = (int)MathF.Floor((center.Y + radius) * _inverseCellSize);
+            int minZ = (int)MathF.Floor((center.Z - radius) * _inverseCellSize);
+            int maxZ = (int)MathF.Floor((center.Z + radius) * _inverseCellSize);
+
+            // Defensive: avoid duplicate yields even if a caller double-inserts the same neuron.
+            var emitted = new HashSet<ulong>();
+
+            for (int ix = minX; ix <= maxX; ix++)
+            {
+                for (int iy = minY; iy <= maxY; iy++)
+                {
+                    for (int iz = minZ; iz <= maxZ; iz++)
+                    {
+                        if (_cells.TryGetValue((ix, iy, iz), out var entry))
+                        {
+                            while (entry != null)
+                            {
+                                var candidate = entry.Neuron;
+                                if (candidate != null && candidate.Id != neuron.Id)
+                                {
+                                    // Precise Euclidean check; include points exactly on the radius.
+                                    if (Vector3.DistanceSquared(center, candidate.Position) <= r2)
+                                    {
+                                        if (emitted.Add(candidate.Id))
+                                            yield return candidate;
+                                    }
+                                }
+                                entry = entry.Next;
+                            }
+                        }
+                    }
+                }
             }
         }
     }

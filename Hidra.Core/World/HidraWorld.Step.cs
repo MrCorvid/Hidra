@@ -1,356 +1,671 @@
 // Hidra.Core/World/HidraWorld.Step.cs
-namespace Hidra.Core;
-
+using Hidra.Core.Brain;
+using Hidra.Core.Logging;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Threading;
-using Hidra.Core.Brain;
-using Hidra.Core.Logging;
 
-/// <summary>
-/// This partial class contains the core simulation loop logic for the HidraWorld.
-/// </summary>
-public partial class HidraWorld
+namespace Hidra.Core
 {
-    /// <summary>
-    /// Advances the simulation by a single time step (tick).
-    /// </summary>
-    /// <remarks>
-    /// This is the main engine loop, executed in several distinct, deterministic phases:
-    /// 1.  **Snapshot:** Capture the state of all neuron and input node outputs from the previous tick.
-    /// 2.  **Decay &amp; Recovery:** Apply passive processes like potential decay, health tax, and adaptive threshold recovery.
-    /// 3.  **Signal Processing:** Calculate and apply all continuous signals (Immediate, Persistent, Transient) using the snapshots.
-    /// 4.  **Firing &amp; Event Queuing:** Neurons check their total potential against their threshold and queue `Activate` events for the next tick if they fire.
-    /// 5.  **Event Processing:** Process all events scheduled for the current tick from the event queue.
-    /// 6.  **Cleanup:** Deactivate neurons and remove synapses that were marked for removal during the tick.
-    /// </remarks>
-    public void Step()
+    public partial class HidraWorld
     {
-        CurrentTick++;
-        Logger.Log("SIM_CORE", LogLevel.Debug, $"--- Tick {CurrentTick} Start ---");
+        [JsonIgnore] 
+        private List<Neuron>? _topologicallySortedNeurons = null;
+        [JsonIgnore] 
+        private Dictionary<ulong, List<Synapse>>? _incomingSynapseCache = null;
+        [JsonIgnore]
+        private Dictionary<ulong, List<Synapse>>? _inputSynapseCache = null;
 
-        // PHASE 1: Take snapshots of all node states from the end of the previous tick.
-        var inputSnapshots = _inputNodes.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Value);
-        var neuronSnapshots = _neurons.Values.Where(n => n.IsActive)
-                                    .ToDictionary(n => n.Id, n =>
-                                        n.LocalVariables[(int)LVarIndex.SomaPotential] +
-                                        n.LocalVariables[(int)LVarIndex.DendriticPotential]);
+        // Intra-tick event lists for deterministic processing
+        [JsonIgnore] private readonly List<Event> _currentTickPulses = new();
+        [JsonIgnore] private readonly List<Event> _currentTickOtherEvents = new();
+        [JsonIgnore] private readonly List<Event> _nextTickEvents = new();
 
-        // PHASE 2: Apply decay, recovery, and aging.
-        foreach (var neuron in _neurons.Values)
+        /// <summary>
+        /// Gets a value indicating whether the simulation has been stopped due to a fatal error.
+        /// </summary>
+        [JsonIgnore]
+        public bool IsHalted { get; private set; } = false;
+
+        /// <summary>
+        /// Advances the simulation by a single time step (tick). This is a thread-safe wrapper
+        /// around the main simulation logic.
+        /// </summary>
+        public void Step()
         {
-            if (!neuron.IsActive) continue;
-
-            neuron.LocalVariables[(int)LVarIndex.SomaPotential] *= neuron.LocalVariables[(int)LVarIndex.DecayRate];
-            neuron.LocalVariables[(int)LVarIndex.DendriticPotential] = 0f;
-            neuron.LocalVariables[(int)LVarIndex.Age]++;
-            neuron.LocalVariables[(int)LVarIndex.Health] -= Config.MetabolicTaxPerTick;
-
-            if (neuron.LocalVariables[(int)LVarIndex.Health] <= 0)
+            if (IsHalted)
             {
-                MarkNeuronForDeactivation(neuron);
-                continue;
+                Log("SIM_CORE", LogLevel.Warning, $"Attempted to step a world that has been halted due to a fatal error on tick {CurrentTick}.");
+                return;
             }
 
-            if (neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft] > 0)
-                neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft]--;
-
-            neuron.LocalVariables[(int)LVarIndex.AdaptiveThreshold] *= (1.0f - neuron.LocalVariables[(int)LVarIndex.ThresholdRecoveryRate]);
-            neuron.LocalVariables[(int)LVarIndex.FiringRate] *= Config.FiringRateMAWeight;
-        }
-        foreach (var synapse in _synapses)
-        {
-            if (synapse.IsActive)
-                synapse.FatigueLevel *= (1.0f - synapse.FatigueRecoveryRate);
-        }
-
-        // PHASE 3: Single-Pass Universal Signal Processing.
-        _scratchDendritic.Clear();
-
-        foreach (var synapse in _synapses)
-        {
-            if (!synapse.IsActive)
+            lock (_worldApiLock)
             {
-                _synapsesToRemove.Add(synapse);
-                continue;
-            }
-
-            float sourceValue = 0f;
-            if (_inputNodes.ContainsKey(synapse.SourceId))
-                inputSnapshots.TryGetValue(synapse.SourceId, out sourceValue);
-            else if (_neurons.ContainsKey(synapse.SourceId))
-                neuronSnapshots.TryGetValue(synapse.SourceId, out sourceValue);
-
-            _neurons.TryGetValue(synapse.TargetId, out var targetNeuron);
-            var context = new ConditionContext(this, synapse, _neurons.GetValueOrDefault(synapse.SourceId), _inputNodes.GetValueOrDefault(synapse.SourceId), targetNeuron, sourceValue);
-            bool passes = synapse.Condition == null || synapse.Condition.Evaluate(context);
-
-            // Invariant: PreviousSourceValue must be updated here for correct temporal (t-1 -> t) comparisons on the next tick.
-            synapse.PreviousSourceValue = sourceValue;
-
-            if (synapse.SignalType == SignalType.Delayed || !passes) continue;
-
-            float transmittedValue = 0f;
-            switch (synapse.SignalType)
-            {
-                case SignalType.Immediate:
-                    transmittedValue = CalculateTransmittedValue(sourceValue, synapse, true);
-                    break;
-                case SignalType.Persistent when synapse.IsPersistentValueSet:
-                    transmittedValue = synapse.PersistentValue;
-                    break;
-                case SignalType.Transient when synapse.TransientTriggerTick == CurrentTick:
-                    transmittedValue = CalculateTransmittedValue(1.0f, synapse, true);
-                    break;
-            }
-
-            if (transmittedValue == 0f) continue;
-
-            if (targetNeuron is { IsActive: true })
-            {
-                if (!_scratchDendritic.TryGetValue(targetNeuron.Id, out var acc))
-                {
-                    acc = new KahanAccumulator();
-                    _scratchDendritic[targetNeuron.Id] = acc;
-                }
-                acc.Add(transmittedValue);
-            }
-            else if (_outputNodes.TryGetValue(synapse.TargetId, out var outputNode))
-            {
-                float smoothing = Math.Clamp(synapse.Parameter, 0.0f, 1.0f);
-                outputNode.Value = (1f - smoothing) * outputNode.Value + smoothing * transmittedValue;
+                StepInternal();
             }
         }
-
-        foreach (var (neuronId, accumulator) in _scratchDendritic)
-        {
-            if (_neurons.TryGetValue(neuronId, out var neuron) && neuron.IsActive)
-                neuron.LocalVariables[(int)LVarIndex.DendriticPotential] = accumulator.Sum;
-        }
-
-        // PHASE 4 & 5: Process event-based triggers (pulsed inputs and neuron firing).
-        for (var i = 0; i < _synapses.Count; i++)
-        {
-            var synapse = _synapses[i];
-            if (!synapse.IsActive || !_inputNodes.ContainsKey(synapse.SourceId)) continue;
-
-            if (inputSnapshots.TryGetValue(synapse.SourceId, out var inputValue) && inputValue >= synapse.Parameter)
-            {
-                float pulsePayload = CalculateTransmittedValue(1.0f, synapse, true);
-                var eventId = (ulong)Interlocked.Increment(ref _nextEventId);
-                if (synapse.SignalType == SignalType.Delayed)
-                {
-                    _eventQueue.Push(new Event { Id = eventId, Type = EventType.PotentialPulse, TargetId = synapse.TargetId, ExecutionTick = CurrentTick + 1, Payload = pulsePayload });
-                }
-                else if (synapse.SignalType == SignalType.Transient)
-                {
-                    synapse.TransientTriggerTick = CurrentTick + 1;
-                }
-            }
-        }
-
-        foreach (var neuron in _neurons.Values)
-        {
-            if (!neuron.IsActive || neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft] > 0) continue;
-
-            float totalPotential = neuron.LocalVariables[(int)LVarIndex.DendriticPotential] + neuron.LocalVariables[(int)LVarIndex.SomaPotential];
-            float effectiveThreshold = neuron.LocalVariables[(int)LVarIndex.FiringThreshold] + neuron.LocalVariables[(int)LVarIndex.AdaptiveThreshold];
-
-            if (totalPotential >= effectiveThreshold)
-            {
-                _eventQueue.Push(new Event { Id = (ulong)Interlocked.Increment(ref _nextEventId), ExecutionTick = CurrentTick + 1, Type = EventType.Activate, TargetId = neuron.Id, Payload = totalPotential });
-                neuron.LocalVariables[(int)LVarIndex.SomaPotential] = 0.0f;
-                neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft] = neuron.LocalVariables[(int)LVarIndex.RefractoryPeriod];
-                neuron.LocalVariables[(int)LVarIndex.AdaptiveThreshold] += neuron.LocalVariables[(int)LVarIndex.ThresholdAdaptationFactor];
-                neuron.LocalVariables[(int)LVarIndex.FiringRate] += (1.0f - Config.FiringRateMAWeight);
-            }
-        }
-
-        _eventQueue.ProcessDueEvents(CurrentTick, ProcessEvent);
-
-        // FINAL PHASE: Cleanup and Deactivation
-        bool anythingChanged = false;
-
-        if (_synapsesToRemove.Count > 0)
-        {
-            anythingChanged = true;
-            Logger.Log("SIM_CORE", LogLevel.Debug, $"Removing {_synapsesToRemove.Count} inactive synapses.");
-            var synapsesToRemoveSet = new HashSet<Synapse>(_synapsesToRemove);
-            _synapses.RemoveAll(s => synapsesToRemoveSet.Contains(s));
-            foreach (var neuron in _neurons.Values)
-                neuron.OwnedSynapses.RemoveAll(s => synapsesToRemoveSet.Contains(s));
-            _synapsesToRemove.Clear();
-        }
-
-        if (_neuronsToDeactivate.Count > 0)
-        {
-            anythingChanged = true;
-            foreach (var neuronToDeactivate in _neuronsToDeactivate)
-            {
-                if (neuronToDeactivate.IsActive)
-                {
-                    neuronToDeactivate.IsActive = false;
-                    QueueApoptosisEventsFor(neuronToDeactivate);
-                    Logger.Log("SIM_CORE", LogLevel.Debug, $"Neuron {neuronToDeactivate.Id} deactivated.");
-                }
-            }
-            _neuronsToDeactivate.Clear();
-        }
-
-        if (anythingChanged)
-        {
-            RebuildSpatialHash();
-        }
-        Logger.Log("SIM_CORE", LogLevel.Debug, $"--- Tick {CurrentTick} End ---");
-    }
-
-    private void ProcessEvent(Event e)
-    {
-        lock (_eventHistoryLock)
-        {
-            if (!_eventHistory.ContainsKey(CurrentTick))
-                _eventHistory[CurrentTick] = new List<Event>();
-            _eventHistory[CurrentTick].Add(e);
-        }
-
-        switch (e.Type)
-        {
-            case EventType.ExecuteGene: // System-queued events (e.g., Gestation, Apoptosis)
-                if (e.Payload is uint geneId)
-                {
-                    _neurons.TryGetValue(e.TargetId, out var geneTarget);
-                    ExecuteGene(geneId, geneTarget, GetInitialContextForGene(geneId));
-                }
-                break;
-
-            case EventType.ExecuteGeneFromBrain: // Neuron brain-initiated events
-                if (e.Payload is uint internalGeneId && _neurons.TryGetValue(e.TargetId, out var geneTarget))
-                {
-                    ExecuteGene(internalGeneId, geneTarget, ExecutionContext.General);
-                }
-                break;
-
-            case EventType.Activate:
-                if (e.Payload is float activationPotential && _neurons.TryGetValue(e.TargetId, out var activationTarget) && activationTarget.IsActive)
-                    ProcessNeuronActivation(activationTarget, activationPotential);
-                break;
-
-            case EventType.PotentialPulse:
-                if (e.Payload is not float potential) break;
-                
-                if (_neurons.TryGetValue(e.TargetId, out var pulseTargetNeuron) && pulseTargetNeuron.IsActive)
-                    pulseTargetNeuron.LocalVariables[(int)LVarIndex.SomaPotential] += potential;
-                else if (_outputNodes.TryGetValue(e.TargetId, out var pulseTargetOutput))
-                    pulseTargetOutput.Value += potential;
-                break;
-        }
-    }
-
-    /// <summary>
-    /// Queues the Apoptosis gene to be executed on all downstream neurons connected via a deceased neuron's outgoing synapses.
-    /// </summary>
-    /// <param name="deceasedNeuron">The neuron that has just become inactive.</param>
-    private void QueueApoptosisEventsFor(Neuron deceasedNeuron)
-    {
-        foreach (var synapse in deceasedNeuron.OwnedSynapses.Where(s => s.SourceId == deceasedNeuron.Id))
-        {
-            if (_neurons.ContainsKey(synapse.TargetId))
-            {
-                var eventId = (ulong)Interlocked.Increment(ref _nextEventId);
-                _eventQueue.Push(new Event { Id = eventId, Type = EventType.ExecuteGene, TargetId = synapse.TargetId, ExecutionTick = CurrentTick + 1, Payload = SYS_GENE_APOPTOSIS });
-            }
-        }
-    }
-
-    private void ProcessNeuronActivation(Neuron neuron, float activationPotential)
-    {
-        float brainOutputValue = activationPotential;
         
-        if (neuron.Brain != null)
+        /// <summary>
+        /// Orchestrates the execution of a single simulation tick through a series of distinct, fault-tolerant phases.
+        /// If any phase fails, the simulation is halted to prevent data corruption.
+        /// </summary>
+        private void StepInternal()
         {
-            var brainInputs = new float[neuron.Brain.InputMap.Count];
-            for (var i = 0; i < brainInputs.Length; i++)
+            Log("SIM_CORE", LogLevel.Debug, $"--- Tick {CurrentTick} Start ---");
+
+            if (!ExecutePhase(Phase0_InitializeTick, "Initialization")) return;
+            if (!ExecutePhase(Phase1_PassiveUpdates, "Passive Updates")) return;
+            if (!ExecutePhase(Phase2_ProcessInputs, "Input Processing")) return;
+            if (!ExecutePhase(Phase3_EvaluateNeurons, "Neuron Evaluation")) return;
+            if (!ExecutePhase(Phase4_ProcessIntraTickEvents, "Event Processing")) return;
+            if (!ExecutePhase(Phase5_ProcessDeactivations, "Deactivation")) return;
+            if (!ExecutePhase(Phase6_QueueNewEvents, "Queue New Events")) return;
+            if (!ExecutePhase(Phase7_ArchiveAndAdvance, "Archive & Advance")) return;
+
+            Log("SIM_CORE", LogLevel.Debug, $"--- Tick {CurrentTick-1} End ---");
+        }
+
+        /// <summary>
+        /// A supervisory wrapper that executes a simulation phase, catching and logging any exceptions.
+        /// If an exception occurs, the simulation is halted.
+        /// </summary>
+        /// <param name="phaseAction">The delegate for the phase to execute.</param>
+        /// <param name="phaseName">The name of the phase for logging purposes.</param>
+        /// <returns>True if the phase completed successfully, false otherwise.</returns>
+        private bool ExecutePhase(Action phaseAction, string phaseName)
+        {
+            try
             {
-                brainInputs[i] = GetValueForBrainInput(neuron.Brain.InputMap[i], neuron, activationPotential);
+                phaseAction();
+                return true;
             }
-            neuron.Brain.Evaluate(brainInputs);
+            catch (Exception ex)
+            {
+                IsHalted = true;
+                Log("SIM_FATAL", LogLevel.Error, $"--- SIMULATION HALTED ON TICK {CurrentTick} DURING PHASE: {phaseName} ---");
+                Log("SIM_FATAL", LogLevel.Error, $"Fatal exception: {ex.Message}\nStack Trace:\n{ex.StackTrace}");
+                return false;
+            }
+        }
 
-            var moveVector = Vector3.Zero;
-            bool hasMoveOutput = false;
+        #region Simulation Phases
 
+        /// <summary>
+        /// Phase 0: Prepares the world state for the current tick's calculations.
+        /// </summary>
+        private void Phase0_InitializeTick()
+        {
+            EnsureCachesUpToDate();
+            _currentTickPulses.Clear();
+            _currentTickOtherEvents.Clear();
+            _nextTickEvents.Clear();
+            _eventQueue.ProcessAndPartionDueEvents(CurrentTick, _currentTickPulses, _currentTickOtherEvents);
+        }
+
+        /// <summary>
+        /// Phase 1: Applies passive, time-based changes to all world entities (decay, aging, etc.).
+        /// </summary>
+        private void Phase1_PassiveUpdates()
+        {
+            foreach (var neuron in _neurons.Values)
+            {
+                if (!neuron.IsActive) continue;
+                neuron.LocalVariables[(int)LVarIndex.SomaPotential] *= (1.0f - neuron.LocalVariables[(int)LVarIndex.DecayRate]);
+                neuron.LocalVariables[(int)LVarIndex.FiringRate] *= Config.FiringRateMAWeight;
+                neuron.LocalVariables[(int)LVarIndex.Age]++;
+                neuron.LocalVariables[(int)LVarIndex.Health] -= Config.MetabolicTaxPerTick;
+                if (neuron.LocalVariables[(int)LVarIndex.Health] <= 0f) { _neuronsToDeactivate.Add(neuron); continue; }
+                if (neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft] > 0f) { neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft]--; }
+            }
+            foreach (var syn in _synapses)
+            {
+                if (!syn.IsActive) continue;
+                syn.FatigueLevel = Math.Max(0f, syn.FatigueLevel - syn.FatigueRecoveryRate);
+            }
+        }
+
+        /// <summary>
+        /// Phase 2: Processes external inputs, generating PotentialPulse events for the current tick.
+        /// </summary>
+        private void Phase2_ProcessInputs()
+        {
+            if (_inputSynapseCache == null) return;
+            
+            foreach (var inputNode in _inputNodes.Values.OrderBy(n => n.Id))
+            {
+                if (!_inputSynapseCache.TryGetValue(inputNode.Id, out var outgoing)) continue;
+                foreach (var syn in outgoing)
+                {
+                    var target = _neurons.GetValueOrDefault(syn.TargetId);
+                    var ctx = new ConditionContext(this, syn, null, inputNode, target, inputNode.Value);
+                    bool conditionMet = syn.Condition?.Evaluate(ctx) ?? (inputNode.Value > 0f);
+                    if (!conditionMet) { syn.PreviousSourceValue = inputNode.Value; continue; }
+
+                    var evtIdPulse = (ulong)Interlocked.Increment(ref _nextEventId);
+                    float pulseValue = inputNode.Value * syn.Weight;
+
+                    ulong executionTick = syn.SignalType switch
+                    {
+                        SignalType.Delayed => CurrentTick + (ulong)Math.Max(0, syn.Parameter),
+                        _ => CurrentTick
+                    };
+
+                    var pulseEvt = new Event 
+                    { 
+                        Id = evtIdPulse, 
+                        ExecutionTick = executionTick,
+                        Type = EventType.PotentialPulse, 
+                        TargetId = syn.TargetId, 
+                        Payload = new EventPayload(PulseValue: pulseValue) 
+                    };
+                    
+                    if (executionTick == CurrentTick)
+                    {
+                        _currentTickPulses.Add(pulseEvt);
+                    }
+                    else
+                    {
+                        _nextTickEvents.Add(pulseEvt);
+                    }
+                    
+                    if (target != null)
+                    {
+                        var lv = target.LocalVariables;
+                        var pos = target.Position;
+                        Log("INPUT_PULSE", LogLevel.Info,
+                            $"{{\"tick\":{CurrentTick},\"inputNodeId\":{inputNode.Id},\"inputValue\":{inputNode.Value}," +
+                            $"\"synapseId\":{syn.Id},\"synapseWeight\":{syn.Weight},\"signalType\":\"{syn.SignalType}\"," +
+                            $"\"targetNeuronId\":{target.Id},\"targetPre\":{{\"pos\":{{\"x\":{pos.X},\"y\":{pos.Y},\"z\":{pos.Z}}}," +
+                            $"\"soma\":{lv[(int)LVarIndex.SomaPotential]},\"dend\":{lv[(int)LVarIndex.DendriticPotential]},\"thr\":{lv[(int)LVarIndex.FiringThreshold]},\"athr\":{lv[(int)LVarIndex.AdaptiveThreshold]},\"rate\":{lv[(int)LVarIndex.FiringRate]}," +
+                            $"\"health\":{lv[(int)LVarIndex.Health]},\"age\":{lv[(int)LVarIndex.Age]},\"refrLeft\":{lv[(int)LVarIndex.RefractoryTimeLeft]}}}," +
+                            $"\"pulseEvent\":{{\"id\":{evtIdPulse},\"type\":\"PotentialPulse\",\"execTick\":{executionTick},\"targetId\":{syn.TargetId},\"payload\":{{\"PulseValue\":{pulseValue}}}}}}}");
+                    }
+
+                    syn.PreviousSourceValue = inputNode.Value;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Phase 3: Accumulates pulses and evaluates neuron firing thresholds, generating Activate events for the current tick.
+        /// </summary>
+        private void Phase3_EvaluateNeurons()
+        {
+            var accumulated = new Dictionary<ulong, float>();
+
+            foreach (var p in _currentTickPulses)
+            {
+                if (!p.Payload.PulseValue.HasValue) continue;
+                float val = p.Payload.PulseValue.Value;
+
+                if (_neurons.ContainsKey(p.TargetId))
+                {
+                    float cur = accumulated.GetValueOrDefault(p.TargetId, 0f) + val;
+                    accumulated[p.TargetId] = cur;
+                    continue;
+                }
+
+                if (_outputNodes.TryGetValue(p.TargetId, out var outNode))
+                {
+                    outNode.Value = val;
+                    Log("OUTPUT_PULSE", LogLevel.Info,
+                        $"{{\"tick\":{CurrentTick},\"outputNodeId\":{outNode.Id},\"value\":{outNode.Value},\"eventId\":{p.Id}}}");
+                    continue;
+                }
+            }
+
+            foreach (var neuron in _topologicallySortedNeurons!)
+            {
+                if (!neuron.IsActive) continue;
+                float dend = CalculateDendriticBaseline(neuron);
+                neuron.LocalVariables[(int)LVarIndex.DendriticPotential] = dend;
+                float incoming = accumulated.GetValueOrDefault(neuron.Id, 0f);
+                neuron.LocalVariables[(int)LVarIndex.SomaPotential] += incoming;
+
+                if (neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft] <= 0f)
+                {
+                    float thr = neuron.LocalVariables[(int)LVarIndex.FiringThreshold] + neuron.LocalVariables[(int)LVarIndex.AdaptiveThreshold];
+                    float total = neuron.LocalVariables[(int)LVarIndex.SomaPotential] + dend;
+                    if (total >= thr)
+                    {
+                        var evtIdActivate = (ulong)Interlocked.Increment(ref _nextEventId);
+                        var activateEvt = new Event { Id = evtIdActivate, ExecutionTick = CurrentTick, Type = EventType.Activate, TargetId = neuron.Id, Payload = new EventPayload(ActivationPotential: total) };
+                        _currentTickOtherEvents.Add(activateEvt);
+                        Log("EVENT_GEN", LogLevel.Debug, $"Neuron {neuron.Id} threshold met ({total} >= {thr}); queued Activate event {evtIdActivate} for tick {CurrentTick}.");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Phase 4: Processes all non-pulse events scheduled for this tick, such as neuron activations.
+        /// This phase generates events for FUTURE ticks.
+        /// </summary>
+        private void Phase4_ProcessIntraTickEvents()
+        {
+            _currentTickOtherEvents.Sort((a, b) => a.Id.CompareTo(b.Id));
+            foreach (var e in _currentTickOtherEvents)
+                ProcessEvent(e);
+        }
+
+        /// <summary>
+        /// Phase 5: Deactivates neurons that have "died" during this tick and queues any resulting events.
+        /// </summary>
+        private void Phase5_ProcessDeactivations()
+        {
+            if (_neuronsToDeactivate.Count > 0)
+            {
+                foreach (var n in _neuronsToDeactivate)
+                {
+                    if (!n.IsActive) continue;
+                    QueueApoptosisEventsFor(n);
+                    n.IsActive = false;
+                }
+                _neuronsToDeactivate.Clear();
+                _topologicallySortedNeurons = null; _incomingSynapseCache = null; _inputSynapseCache = null;
+            }
+        }
+
+        /// <summary>
+        /// Phase 6: Takes all newly generated future events from the buffer and adds them to the main event queue.
+        /// </summary>
+        private void Phase6_QueueNewEvents()
+        {
+            foreach (var evt in _nextTickEvents)
+            {
+                _eventQueue.Push(evt);
+            }
+        }
+
+        /// <summary>
+        /// Phase 7: Archives all events processed in this tick, collects metrics, and increments the tick counter.
+        /// </summary>
+        private void Phase7_ArchiveAndAdvance()
+        {
+            if (Config.MetricsEnabled &&
+                _metricsRing != null &&
+                _neurons.Count > 0 &&
+                CurrentTick % (ulong)Config.MetricsCollectionInterval == 0)
+            {
+                var snapshot = BuildWorldSnapshot(includeSynapses: Config.MetricsIncludeSynapses);
+                _metricsRing[_metricsHead] = snapshot;
+                _metricsHead = (_metricsHead + 1) % Config.MetricsRingCapacity;
+                if (_metricsHead == 0 && Config.MetricsRingCapacity > 0)
+                {
+                    _metricsWrapped = true;
+                }
+            }
+
+            lock (_eventHistoryLock)
+            {
+                if (!_eventHistory.TryGetValue(CurrentTick, out var bucket))
+                {
+                    bucket = new List<Event>(_currentTickPulses.Count + _currentTickOtherEvents.Count);
+                    _eventHistory[CurrentTick] = bucket;
+                }
+                bucket.AddRange(_currentTickPulses);
+                bucket.AddRange(_currentTickOtherEvents);
+            }
+            
+            CurrentTick++;
+        }
+
+        #endregion
+        
+        /// <summary>
+        /// Handles the logic for a single event based on its type.
+        /// </summary>
+        private void ProcessEvent(Event e)
+        {
+            switch (e.Type)
+            {
+                case EventType.ExecuteGene:
+                    if (e.Payload.GeneId.HasValue) 
+                        ExecuteGene(e.Payload.GeneId.Value, _neurons.GetValueOrDefault(e.TargetId), GetInitialContextForGene(e.Payload.GeneId.Value));
+                    break;
+                    
+                case EventType.ExecuteGeneFromBrain:
+                    if (e.Payload.GeneId.HasValue) 
+                        ExecuteGene(e.Payload.GeneId.Value, _neurons.GetValueOrDefault(e.TargetId), GetInitialContextForGene(e.Payload.GeneId.Value));
+                    break;
+                    
+                case EventType.Activate:
+                    if (_neurons.TryGetValue(e.TargetId, out var neuron) && neuron.IsActive && e.Payload.ActivationPotential.HasValue)
+                        ProcessNeuronActivation(neuron, e.Payload.ActivationPotential.Value);
+                    break;
+            }
+        }
+        
+        /// <summary>
+        /// Handles the full sequence of actions when a neuron fires, from brain evaluation to synaptic propagation.
+        /// </summary>
+        private void ProcessNeuronActivation(Neuron neuron, float activationPotential)
+        {
+            var logBuilder = new System.Text.StringBuilder();
+            logBuilder.AppendLine($"--- NEURON ACTIVATION START ---");
+            logBuilder.AppendLine($" Tick: {CurrentTick}, Neuron ID: {neuron.Id}");
+            logBuilder.AppendLine(" Neuron State at Activation:");
+            logBuilder.AppendLine($"  - IsActive: {neuron.IsActive}");
+            logBuilder.AppendLine($"  - Position: {{ X:{neuron.Position.X}, Y:{neuron.Position.Y}, Z:{neuron.Position.Z} }}");
+            logBuilder.AppendLine($"  - Soma Potential (pre-reset): {neuron.LocalVariables[(int)LVarIndex.SomaPotential]}");
+            logBuilder.AppendLine($"  - Dendritic Potential: {neuron.LocalVariables[(int)LVarIndex.DendriticPotential]}");
+            logBuilder.AppendLine($"  - Health: {neuron.LocalVariables[(int)LVarIndex.Health]}");
+            logBuilder.AppendLine($"  - Age: {neuron.LocalVariables[(int)LVarIndex.Age]}");
+            logBuilder.AppendLine($"  - Firing Rate: {neuron.LocalVariables[(int)LVarIndex.FiringRate]}");
+            logBuilder.AppendLine($"  - Refractory Time Left (pre-reset): {neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft]}");
+            logBuilder.AppendLine(" Activation Inputs:");
+            logBuilder.AppendLine($"  - Activation Potential (from threshold check): {activationPotential}");
+            float brainOutputValue = 0f;
+            var brainInputs = new float[neuron.Brain.InputMap.Count];
+            logBuilder.AppendLine("  - Brain Inputs Evaluation:");
+            if (brainInputs.Length == 0)
+            {
+                logBuilder.AppendLine("    - No inputs mapped to the brain.");
+            }
+            for (int i = 0; i < brainInputs.Length; i++)
+            {
+                var mapping = neuron.Brain.InputMap[i];
+                brainInputs[i] = GetValueForBrainInput(mapping, neuron, activationPotential);
+                logBuilder.AppendLine($"    - Input[{i}]: Source={mapping.SourceType}, Index={mapping.SourceIndex} -> Value={brainInputs[i]}");
+            }
+            logBuilder.AppendLine(" Brain Evaluation:");
+            logBuilder.AppendLine($"  - Brain Type: {neuron.Brain.GetType().Name}");
+            neuron.Brain.Evaluate(brainInputs, _logAction);
+            logBuilder.AppendLine($"  - Initial Brain Output Value: {brainOutputValue}");
+            if (neuron.Brain.OutputMap.Count == 0)
+            {
+                logBuilder.AppendLine("    - No outputs mapped from the brain. Output value remains the activation potential.");
+            }
             foreach (var output in neuron.Brain.OutputMap)
             {
-                if (output.Value == 0 && output.ActionType != OutputActionType.SetOutputValue) continue;
-
+                logBuilder.AppendLine($"  - Processing Brain Output: Action={output.ActionType}, Value={output.Value}");
                 switch (output.ActionType)
                 {
-                    case OutputActionType.Move:
-                        moveVector.X = output.Value; 
-                        hasMoveOutput = true;
-                        break;
-                    case OutputActionType.ExecuteGene:
-                        uint userGeneIndex = (uint)Math.Abs(output.Value);
-                        uint internalGeneId = userGeneIndex + Config.SystemGeneCount;
-                        var eventId = (ulong)Interlocked.Increment(ref _nextEventId);
-                        _eventQueue.Push(new Event { Id = eventId, Type = EventType.ExecuteGeneFromBrain, TargetId = neuron.Id, ExecutionTick = CurrentTick + 1, Payload = internalGeneId });
-                        break;
                     case OutputActionType.SetOutputValue:
                         brainOutputValue = output.Value;
+                        logBuilder.AppendLine($"    - Outcome: Brain output value was SET to {brainOutputValue}.");
+                        break;
+
+                    case OutputActionType.ExecuteGene:
+                        uint internalGeneId = (uint)Math.Abs(output.Value) + Config.SystemGeneCount;
+                        var execEvtId = (ulong)Interlocked.Increment(ref _nextEventId);
+                        var execEvt = new Event
+                        {
+                            Id = execEvtId,
+                            ExecutionTick = CurrentTick + 1,
+                            Type = EventType.ExecuteGeneFromBrain,
+                            TargetId = neuron.Id,
+                            Payload = new EventPayload { GeneId = internalGeneId }
+                        };
+                        _nextTickEvents.Add(execEvt);
+                        logBuilder.AppendLine($"    - Outcome: Queued ExecuteGeneFromBrain event for GeneID {internalGeneId} on Tick {CurrentTick + 1}.");
                         break;
                 }
             }
-            if (hasMoveOutput) { neuron.Position += moveVector; }
-        }
-        
-        foreach (var synapse in neuron.OwnedSynapses.Where(s => s.SourceId == neuron.Id && s.IsActive))
-        {
-            float transmittedValue = CalculateTransmittedValue(brainOutputValue, synapse, true);
-            var eventId = (ulong)Interlocked.Increment(ref _nextEventId);
-
-            switch (synapse.SignalType)
+            logBuilder.AppendLine($"  - Final Brain Output Value for Synapses: {brainOutputValue}");
+            logBuilder.AppendLine(" Outgoing Synapse Propagation:");
+            if (neuron.OwnedSynapses.Count == 0)
             {
-                case SignalType.Delayed:
-                    _eventQueue.Push(new Event { Id = eventId, Type = EventType.PotentialPulse, TargetId = synapse.TargetId, ExecutionTick = CurrentTick + 1, Payload = transmittedValue });
-                    break;
-                case SignalType.Persistent:
-                    synapse.PersistentValue = transmittedValue;
-                    synapse.IsPersistentValueSet = true;
-                    break;
-                case SignalType.Transient:
-                    synapse.TransientTriggerTick = CurrentTick + 1;
-                    break;
+                logBuilder.AppendLine("  - No outgoing synapses from this neuron.");
+            }
+            foreach (var synapse in neuron.OwnedSynapses.Where(s => s.SourceId == neuron.Id))
+            {
+                logBuilder.AppendLine($"  - Evaluating Synapse ID: {synapse.Id} (Target: {synapse.TargetId})");
+                logBuilder.AppendLine($"    - Config: IsActive={synapse.IsActive}, Type={synapse.SignalType}, Weight={synapse.Weight}, Param={synapse.Parameter}, Fatigue={synapse.FatigueLevel}, Condition exists={synapse.Condition != null}");
+                if (!synapse.IsActive)
+                {
+                    logBuilder.AppendLine("    - Outcome: Synapse is INACTIVE. No pulse generated.");
+                    continue;
+                }
+                var targetNeuron = _neurons.GetValueOrDefault(synapse.TargetId);
+                var context = new ConditionContext(this, synapse, neuron, null, targetNeuron, brainOutputValue);
+                bool conditionMet = synapse.Condition?.Evaluate(context) ?? true;
+                if (!conditionMet)
+                {
+                    logBuilder.AppendLine($"    - Outcome: Condition check FAILED. No pulse generated.");
+                    synapse.PreviousSourceValue = brainOutputValue;
+                    continue;
+                }
+                logBuilder.AppendLine("    - Condition check PASSED.");
+                if (synapse.SignalType == SignalType.Persistent)
+                {
+                    logBuilder.AppendLine("    - Outcome: SignalType is Persistent. This type does not generate pulse events on activation.");
+                }
+                else
+                {
+                    float transmittedValue = CalculateTransmittedValue(brainOutputValue, synapse, true);
+                    var pulseEventId = (ulong)Interlocked.Increment(ref _nextEventId);
+                    ulong executionTick = synapse.SignalType switch
+                    {
+                        SignalType.Immediate => CurrentTick + 1,
+                        SignalType.Delayed   => CurrentTick + 1 + (ulong)Math.Max(0, synapse.Parameter),
+                        _                    => CurrentTick + 1
+                    };
+                    var newEvent = new Event
+                    {
+                        Id = pulseEventId,
+                        Type = EventType.PotentialPulse,
+                        TargetId = synapse.TargetId,
+                        ExecutionTick = executionTick,
+                        Payload = new EventPayload { PulseValue = transmittedValue }
+                    };
+                    _nextTickEvents.Add(newEvent);
+                    logBuilder.AppendLine($"    - Outcome: SUCCESS. Queued PotentialPulse event for Tick {executionTick}.");
+                    logBuilder.AppendLine($"      - Event ID: {newEvent.Id}, Target ID: {newEvent.TargetId}, Transmitted Value: {transmittedValue}");
+                }
+                synapse.PreviousSourceValue = brainOutputValue;
+            }
+            neuron.LocalVariables[(int)LVarIndex.SomaPotential] = 0;
+            neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft] = neuron.LocalVariables[(int)LVarIndex.RefractoryPeriod];
+            neuron.LocalVariables[(int)LVarIndex.FiringRate] += (1.0f - Config.FiringRateMAWeight);
+            logBuilder.AppendLine(" Post-Activation State Update:");
+            logBuilder.AppendLine($"  - SomaPotential reset to: {neuron.LocalVariables[(int)LVarIndex.SomaPotential]}");
+            logBuilder.AppendLine($"  - RefractoryTimeLeft set to: {neuron.LocalVariables[(int)LVarIndex.RefractoryTimeLeft]}");
+            logBuilder.AppendLine($"  - FiringRate updated to: {neuron.LocalVariables[(int)LVarIndex.FiringRate]}");
+            logBuilder.AppendLine("--- NEURON ACTIVATION END ---");
+            Log("SIM_CORE_ACTIVATION", LogLevel.Info, logBuilder.ToString());
+        }
+
+        /// <summary>
+        /// Calculates the baseline dendritic potential for a neuron from its active, persistent incoming synapses.
+        /// </summary>
+        private float CalculateDendriticBaseline(Neuron neuron)
+        {
+            float dendriticSum = 0f;
+            if (_incomingSynapseCache == null || !_incomingSynapseCache.TryGetValue(neuron.Id, out var incoming))
+                return 0f;
+            foreach (var syn in incoming)
+            {
+                if (!syn.IsActive || syn.SignalType != SignalType.Persistent) continue;
+                float sourceValue = 0f;
+                if (_inputNodes.TryGetValue(syn.SourceId, out var inNode))
+                {
+                    sourceValue = inNode.Value;
+                }
+                else if (_neurons.TryGetValue(syn.SourceId, out var srcNeuron) && srcNeuron.IsActive)
+                {
+                    sourceValue = srcNeuron.LocalVariables[(int)LVarIndex.DendriticPotential]
+                                + srcNeuron.LocalVariables[(int)LVarIndex.SomaPotential];
+                }
+                dendriticSum += sourceValue * syn.Weight;
+            }
+            return dendriticSum;
+        }
+
+        /// <summary>
+        /// Queues the Apoptosis gene to be executed on all downstream neurons connected via a deceased neuron's outgoing synapses.
+        /// </summary>
+        private void QueueApoptosisEventsFor(Neuron deceasedNeuron)
+        {
+            foreach (var synapse in deceasedNeuron.OwnedSynapses.Where(s => s.SourceId == deceasedNeuron.Id && _neurons.ContainsKey(s.TargetId)))
+            {
+                var eventId = (ulong)Interlocked.Increment(ref _nextEventId);
+                var newEvent = new Event { 
+                    Id = eventId, 
+                    Type = EventType.ExecuteGene, 
+                    TargetId = synapse.TargetId, 
+                    ExecutionTick = CurrentTick + 1, 
+                    Payload = new EventPayload { GeneId = SYS_GENE_APOPTOSIS }
+                };
+                _nextTickEvents.Add(newEvent);
             }
         }
-    }
 
-    private float GetValueForBrainInput(BrainInput brainInput, Neuron neuron, float activationPotential) =>
-        brainInput.SourceType switch
+        /// <summary>
+        /// Retrieves the appropriate value from the world or a neuron for a brain's input request.
+        /// </summary>
+        private float GetValueForBrainInput(BrainInput brainInput, Neuron neuron, float activationPotential)
         {
-            InputSourceType.ActivationPotential => activationPotential,
-            InputSourceType.CurrentPotential => neuron.LocalVariables[(int)LVarIndex.DendriticPotential] + neuron.LocalVariables[(int)LVarIndex.SomaPotential],
-            InputSourceType.Health => neuron.LocalVariables[(int)LVarIndex.Health],
-            InputSourceType.Age => neuron.LocalVariables[(int)LVarIndex.Age],
-            InputSourceType.FiringRate => neuron.LocalVariables[(int)LVarIndex.FiringRate],
-            InputSourceType.LocalVariable => (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < neuron.LocalVariables.Length) ? neuron.LocalVariables[brainInput.SourceIndex] : 0f,
-            InputSourceType.GlobalHormone => (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < GlobalHormones.Length) ? GlobalHormones[brainInput.SourceIndex] : 0f,
-            InputSourceType.ConstantOne => 1.0f,
-            InputSourceType.ConstantZero => 0.0f,
-            _ => 0f,
-        };
-
-    private float CalculateTransmittedValue(float inputValue, Synapse synapse, bool applyFatigue)
-    {
-        float effectiveWeight = synapse.Weight * (1.0f - synapse.FatigueLevel);
-        float value = inputValue * effectiveWeight;
-        
-        if (applyFatigue)
-        {
-            synapse.FatigueLevel += Math.Abs(value) * synapse.FatigueRate;
-            if (synapse.FatigueLevel > 1.0f) synapse.FatigueLevel = 1.0f;
+            const int LVAR_COUNT = 256;
+            return brainInput.SourceType switch
+            {
+                InputSourceType.ActivationPotential => activationPotential,
+                InputSourceType.CurrentPotential => neuron.GetPotential(),
+                InputSourceType.Health => neuron.LocalVariables[(int)LVarIndex.Health],
+                InputSourceType.Age => neuron.LocalVariables[(int)LVarIndex.Age],
+                InputSourceType.FiringRate => neuron.LocalVariables[(int)LVarIndex.FiringRate],
+                InputSourceType.LocalVariable => (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < LVAR_COUNT) ? neuron.LocalVariables[brainInput.SourceIndex] : 0f,
+                InputSourceType.GlobalHormone => (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < GlobalHormones.Length) ? GlobalHormones[brainInput.SourceIndex] : 0f,
+                InputSourceType.ConstantOne => 1.0f,
+                InputSourceType.ConstantZero => 0.0f,
+                _ => 0f,
+            };
         }
         
-        return value;
+        /// <summary>
+        /// Calculates the final value transmitted by a synapse after applying weight and fatigue.
+        /// </summary>
+        private float CalculateTransmittedValue(float inputValue, Synapse synapse, bool applyFatigue)
+        {
+            float effectiveWeight = synapse.Weight * (1.0f - synapse.FatigueLevel);
+            float value = inputValue * effectiveWeight;
+            if (applyFatigue)
+            {
+                synapse.FatigueLevel = Math.Min(1.0f, synapse.FatigueLevel + Math.Abs(value) * synapse.FatigueRate);
+            }
+            return value;
+        }
+
+        /// <summary>
+        /// Ensures that runtime caches are built before they are accessed.
+        /// </summary>
+        private void EnsureCachesUpToDate()
+        {
+            if (_topologicallySortedNeurons == null)
+            {
+                RebuildCaches();
+            }
+        }
+
+        /// <summary>
+        /// Rebuilds all runtime caches, including neuron sort order and synapse lookups.
+        /// </summary>
+        private void RebuildCaches()
+        {
+            _topologicallySortedNeurons = TopologicallySortNeurons();
+            
+            _incomingSynapseCache = new Dictionary<ulong, List<Synapse>>();
+            _inputSynapseCache = new Dictionary<ulong, List<Synapse>>();
+
+            foreach (var synapse in _synapses)
+            {
+                if (_neurons.ContainsKey(synapse.TargetId))
+                {
+                    if (!_incomingSynapseCache.ContainsKey(synapse.TargetId))
+                        _incomingSynapseCache[synapse.TargetId] = new List<Synapse>();
+                    _incomingSynapseCache[synapse.TargetId].Add(synapse);
+                }
+
+                if (_inputNodes.ContainsKey(synapse.SourceId))
+                {
+                     if (!_inputSynapseCache.ContainsKey(synapse.SourceId))
+                        _inputSynapseCache[synapse.SourceId] = new List<Synapse>();
+                    _inputSynapseCache[synapse.SourceId].Add(synapse);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Performs a topological sort of neurons based on their shortest path distance from an input node,
+        /// which helps process signals in a more natural data-flow order. Handles graph cycles.
+        /// </summary>
+        private List<Neuron> TopologicallySortNeurons()
+        {
+            Log("SIM_CORE", LogLevel.Info, "Recalculating neuron topological sort based on shortest path from input nodes...");
+            if (_neurons.Count == 0) return new List<Neuron>();
+
+            var adj = _neurons.ToDictionary(kvp => kvp.Key, kvp => new List<ulong>());
+            var inDegree = _neurons.ToDictionary(kvp => kvp.Key, kvp => 0);
+            foreach (var s in _synapses.Where(s => _neurons.ContainsKey(s.SourceId) && _neurons.ContainsKey(s.TargetId)))
+            {
+                adj[s.SourceId].Add(s.TargetId);
+                inDegree[s.TargetId]++;
+            }
+
+            var distances = _neurons.ToDictionary(kvp => kvp.Key, kvp => int.MaxValue);
+            var queue = new Queue<ulong>();
+            foreach (var s in _synapses.Where(s => _inputNodes.ContainsKey(s.SourceId) && _neurons.ContainsKey(s.TargetId)))
+            {
+                if (distances[s.TargetId] == int.MaxValue)
+                {
+                    distances[s.TargetId] = 0;
+                    queue.Enqueue(s.TargetId);
+                }
+            }
+            
+            while (queue.Count > 0)
+            {
+                var u = queue.Dequeue();
+                foreach (var v in adj[u])
+                {
+                    if (distances[v] > distances[u] + 1)
+                    {
+                        distances[v] = distances[u] + 1;
+                        queue.Enqueue(v);
+                    }
+                }
+            }
+
+            var pq = new PriorityQueue<ulong, (int distance, ulong id)>();
+            foreach (var neuron in _neurons.Values)
+            {
+                if (inDegree[neuron.Id] == 0)
+                {
+                    pq.Enqueue(neuron.Id, (distances[neuron.Id], neuron.Id));
+                }
+            }
+
+            var sortedList = new List<Neuron>();
+            while (pq.Count > 0)
+            {
+                var uId = pq.Dequeue();
+                sortedList.Add(_neurons[uId]);
+
+                foreach (var vId in adj[uId])
+                {
+                    inDegree[vId]--;
+                    if (inDegree[vId] == 0)
+                    {
+                        pq.Enqueue(vId, (distances[vId], vId));
+                    }
+                }
+            }
+
+            if (sortedList.Count < _neurons.Count)
+            {
+                Log("SIM_CORE", LogLevel.Warning, "Cycle detected in neuron graph. Appending cyclic neurons to processing order.");
+                var cyclicNeurons = _neurons.Values.Where(n => inDegree[n.Id] > 0).ToList();
+                cyclicNeurons.Sort((a, b) => {
+                    int distCompare = distances[a.Id].CompareTo(distances[b.Id]);
+                    return distCompare != 0 ? distCompare : a.Id.CompareTo(b.Id);
+                });
+                sortedList.AddRange(cyclicNeurons);
+            }
+
+            return sortedList;
+        }
     }
 }
