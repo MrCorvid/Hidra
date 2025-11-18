@@ -464,8 +464,24 @@ namespace Hidra.Core
         GlobalHormone,
         ConstantOne,
         ConstantZero,
-        FiringRate
+        FiringRate,
+        SynapseValue
     }
 
     #endregion
+
+    /// <summary>
+    /// A comprehensive, read-only data container holding a complete snapshot of the world's state.
+    /// This is a domain object intended to be used by the Core and passed to external layers for translation.
+    /// </summary>
+    public record FullWorldState(
+        string ExperimentId,
+        ulong CurrentTick,
+
+        // Collections of full domain objects
+        IReadOnlyList<InputNode> InputNodes,
+        IReadOnlyList<OutputNode> OutputNodes,
+        IReadOnlyList<Neuron> Neurons,
+        IReadOnlyList<Synapse> Synapses
+    );
 }

@@ -22,7 +22,7 @@ namespace Hidra.Core
     "target_type (0=Neuron, 1=Output, 2=Input)", "target_id", "signal_type", "weight", "parameter")]
         public float API_AddSynapse(float targetType, float targetId, float signalType, float weight, float parameter)
         {
-            LogDbg("BRIDGE.SYN", $"API_AddSynapse(tt={targetType}, id={targetId}, sig={signalType}, w={weight}, p={parameter})");
+            LogTrace("BRIDGE.SYN", $"API_AddSynapse(tt={targetType}, id={targetId}, sig={signalType}, w={weight}, p={parameter})");
 
             var self = GetTargetNeuron();
             if (self == null) 
@@ -40,34 +40,33 @@ namespace Hidra.Core
             var resolvedTargetType = (SynapseTargetType)targetType;
             var resolvedSignalType = (SignalType)signalType;
             ulong sourceId = 0, finalTargetId = 0;
+            long longTargetId = (long)targetId; // Use long for modulus calculation
 
             switch (resolvedTargetType)
             {
                 case SynapseTargetType.Neuron:
                     sourceId = self.Id;
                     
-                    if ((ulong)targetId == 0)
+                    if (longTargetId == 0)
                     {
-                        // Case 1: Target ID 0 is an explicit keyword for self-connection.
                         finalTargetId = self.Id;
                     }
-                    else if (_world.GetNeuronById((ulong)targetId) != null)
+                    else if (_world.GetNeuronById((ulong)longTargetId) != null)
                     {
-                        // Case 2: The specified neuron ID exists. Use it directly.
-                        finalTargetId = (ulong)targetId;
+                        finalTargetId = (ulong)longTargetId;
                     }
                     else
                     {
-                        // Case 3 (Fallback): The ID doesn't exist. Apply modulus to OTHER neurons to prevent accidental self-loops.
                         var otherNeuronIds = _world.GetNeuronIdsSnapshot().Where(id => id != self.Id).ToList();
                         if (otherNeuronIds.Count == 0) 
                         {
                             LogWarn("BRIDGE.SYN", "No other neurons exist to target; falling back to self-connection as last resort.");
-                            finalTargetId = self.Id; // Fallback to self only if no other options exist.
+                            finalTargetId = self.Id;
                         }
                         else
                         {
-                            finalTargetId = otherNeuronIds[(int)(Math.Abs((long)targetId) % otherNeuronIds.Count)];
+                            int count = otherNeuronIds.Count;
+                            finalTargetId = otherNeuronIds[(int)((longTargetId % count + count) % count)];
                         }
                     }
                     break;
@@ -81,36 +80,34 @@ namespace Hidra.Core
                         return 0f; 
                     }
 
-                    // Apply direct-addressing logic for outputs.
-                    if (_world.GetOutputNodeById((ulong)targetId) != null)
+                    if (_world.GetOutputNodeById((ulong)longTargetId) != null)
                     {
-                        finalTargetId = (ulong)targetId;
+                        finalTargetId = (ulong)longTargetId;
                     }
                     else
                     {
-                        // Fallback to modulus if the specific ID doesn't exist.
-                        finalTargetId = outputIds[(int)(Math.Abs((long)targetId) % outputIds.Count)];
+                        int count = outputIds.Count;
+                        finalTargetId = outputIds[(int)((longTargetId % count + count) % count)];
                     }
                     break;
 
                 case SynapseTargetType.InputNode:
-                    finalTargetId = self.Id; // Target is always the current neuron for this type.
+                    finalTargetId = self.Id;
                     var inputIds = _world.GetInputIdsSnapshot();
                     if (inputIds.Count == 0) 
                     {
                         LogWarn("BRIDGE.SYN", "No inputs exist; cannot create input->neuron synapse.");
-                        return 0f;
+                        return 0f; 
                     }
 
-                    // Apply direct-addressing logic for selecting the source input node.
-                    if (_world.GetInputNodeById((ulong)targetId) != null)
+                    if (_world.GetInputNodeById((ulong)longTargetId) != null)
                     {
-                        sourceId = (ulong)targetId;
+                        sourceId = (ulong)longTargetId;
                     }
                     else
                     {
-                        // Fallback to modulus if the specific ID doesn't exist.
-                        sourceId = inputIds[(int)(Math.Abs((long)targetId) % inputIds.Count)];
+                        int count = inputIds.Count;
+                        sourceId = inputIds[(int)((longTargetId % count + count) % count)];
                     }
                     break;
 
@@ -126,7 +123,7 @@ namespace Hidra.Core
         [SprakAPI("Modifies the core properties of a synapse (weight, parameter, signal type), leaving its condition unchanged.", "local_index", "new_weight", "new_param", "new_sig_type")]
         public void API_ModifySynapse(float localIndex, float newWeight, float newParameter, float newSignalType)
         {
-            LogDbg("BRIDGE.SYN", $"API_ModifySynapse(idx={localIndex}, w={newWeight}, p={newParameter}, sig={newSignalType})");
+            LogTrace("BRIDGE.SYN", $"API_ModifySynapse(idx={localIndex}, w={newWeight}, p={newParameter}, sig={newSignalType})");
             lock (_world)
             {
                 var synapse = GetSynapseByLocalIndex("API_ModifySynapse", localIndex);
@@ -143,7 +140,7 @@ namespace Hidra.Core
         [SprakAPI("Removes any condition from a synapse, making it unconditional.", "local_index")]
         public void API_ClearSynapseCondition(float localIndex)
         {
-            LogDbg("BRIDGE.SYN", $"API_ClearSynapseCondition(idx={localIndex})");
+            LogTrace("BRIDGE.SYN", $"API_ClearSynapseCondition(idx={localIndex})");
             lock (_world)
             {
                 var synapse = GetSynapseByLocalIndex("API_ClearSynapseCondition", localIndex);
@@ -152,17 +149,30 @@ namespace Hidra.Core
         }
         
         [SprakAPI(
-            "Sets a condition on a synapse. Type: 0=LVar, 1=GVar, 2=Temporal. For LVar, target is Source if available, else Target.",
-            "local_index",
-            "condition_type (0=LVar, 1=GVar, 2=Temporal)",
-            "p1 (LVar:lvar_idx, GVar:gvar_idx, Temporal:temp_op)",
-            "p2 (LVar:comp_op, GVar:comp_op, Temporal:threshold)",
-            "p3 (LVar:value, GVar:value, Temporal:duration_ticks)")]
+    "Sets a condition on a synapse. Type: 0=LVar, 1=GVar, 2=Temporal. For LVar, target is Source if available, else Target.",
+    "local_index",
+    "condition_type (0=LVar, 1=GVar, 2=Temporal)",
+    "p1 (LVar:lvar_idx, GVar:gvar_idx, Temporal:temp_op)",
+    "p2 (LVar:comp_op, GVar:comp_op, Temporal:threshold)",
+    "p3 (LVar:value, GVar:value, Temporal:duration_ticks)")]
         public void API_SetSynapseCondition(float localIndex, float conditionType, float p1, float p2, float p3)
         {
-            var resolvedType = (ConditionType)((int)Math.Abs(conditionType) % _conditionTypeCount);
-            LogDbg("BRIDGE.SYN", $"API_SetSynapseCondition(idx={localIndex}, type={conditionType}->{resolvedType}, p1={p1}, p2={p2}, p3={p3})");
+            LogTrace("BRIDGE.SYN", $"API_SetSynapseCondition(idx={localIndex}, type={conditionType}, p1={p1}, p2={p2}, p3={p3})");
+            
+            ConditionType resolvedType;
+            int intConditionType = (int)conditionType;
 
+            // 1. Literal Enum Check
+            if (Enum.IsDefined(typeof(ConditionType), intConditionType))
+            {
+                resolvedType = (ConditionType)intConditionType;
+            }
+            else // 2. Modulus Fallback
+            {
+                resolvedType = (ConditionType)(((intConditionType % _conditionTypeCount) + _conditionTypeCount) % _conditionTypeCount);
+                LogTrace("BRIDGE.SYN", $"Literal condition_type {intConditionType} invalid; fell back to {resolvedType}.");
+            }
+            
             lock (_world)
             {
                 var synapse = GetSynapseByLocalIndex("API_SetSynapseCondition", localIndex);
@@ -176,24 +186,19 @@ namespace Hidra.Core
                     {
                         var resolvedCompOp = (ComparisonOperator)((int)Math.Abs(p2) % _comparisonOperatorCount);
                         bool isSourceNeuron = _world.GetNeuronById(synapse.SourceId) != null;
-                        ConditionTarget finalTarget = isSourceNeuron ? ConditionTarget.Source : ConditionTarget.Target;
                         
-                        LogDbg("BRIDGE.SYN", $"LVar condition source is {(isSourceNeuron ? "Neuron" : "InputNode")}. Implicitly setting target to {finalTarget}. Operator {p2}->{resolvedCompOp}.");
-
                         newCondition = new LVarCondition
                         {
                             LVarIndex = (int)p1,
                             Operator = resolvedCompOp,
                             Value = p3,
-                            Target = finalTarget
+                            Target = isSourceNeuron ? ConditionTarget.Source : ConditionTarget.Target
                         };
                         break;
                     }
                     case ConditionType.GVar:
                     {
                         var resolvedCompOp = (ComparisonOperator)((int)Math.Abs(p2) % _comparisonOperatorCount);
-                        LogDbg("BRIDGE.SYN", $"GVar condition operator {p2}->{resolvedCompOp}.");
-                        
                         newCondition = new GVarCondition
                         {
                             GVarIndex = (int)p1,
@@ -205,8 +210,6 @@ namespace Hidra.Core
                     case ConditionType.Temporal:
                     {
                         var resolvedTempOp = (TemporalOperator)((int)Math.Abs(p1) % _temporalOperatorCount);
-                        LogDbg("BRIDGE.SYN", $"Temporal condition operator {p1}->{resolvedTempOp}.");
-
                         newCondition = new TemporalCondition
                         {
                             Operator = resolvedTempOp,
@@ -218,18 +221,29 @@ namespace Hidra.Core
                 }
                 
                 synapse.Condition = newCondition;
-                LogDbg("BRIDGE.SYN", $"Synapse[{synapse.Id}] condition set to {resolvedType}.");
             }
         }
         
         [SprakAPI("Modifies a simple property of a synapse.", "local_index", "property_id (0=Weight, 1=Param, 2=SignalType)", "value")]
         public void API_SetSynapseSimpleProperty(float localIndex, float propertyId, float value)
         {
-            LogDbg("BRIDGE.SYN", $"API_SetSynapseSimpleProperty(idx={localIndex}, propId={propertyId}, val={value})");
+            LogTrace("BRIDGE.SYN", $"API_SetSynapseSimpleProperty(idx={localIndex}, propId={propertyId}, val={value})");
             var synapse = GetSynapseByLocalIndex("API_SetSynapseSimpleProperty", localIndex);
             if (synapse == null) return;
             
-            var prop = (SynapseProperty)((int)Math.Abs(propertyId) % _synapsePropertyCount);
+            SynapseProperty prop;
+            int intPropertyId = (int)propertyId;
+
+            // 1. Literal Enum Check
+            if (Enum.IsDefined(typeof(SynapseProperty), intPropertyId))
+            {
+                prop = (SynapseProperty)intPropertyId;
+            }
+            else // 2. Modulus Fallback
+            {
+                prop = (SynapseProperty)(((intPropertyId % _synapsePropertyCount) + _synapsePropertyCount) % _synapsePropertyCount);
+                LogTrace("BRIDGE.SYN", $"Literal property_id {intPropertyId} invalid; fell back to {prop}.");
+            }
 
             switch (prop)
             {
@@ -241,7 +255,7 @@ namespace Hidra.Core
                     break;
                 case SynapseProperty.SignalType:
                     var signalTypeCount = Enum.GetValues(typeof(SignalType)).Length;
-                    var newType = (SignalType)((int)Math.Abs(value) % signalTypeCount);
+                    var newType = (SignalType)(((int)value % signalTypeCount + signalTypeCount) % signalTypeCount);
                     synapse.SignalType = newType;
                     break;
                 case SynapseProperty.Condition:
@@ -260,8 +274,22 @@ namespace Hidra.Core
                 return null;
             }
 
-            int index = (int)Math.Abs(localIndex) % neuron.OwnedSynapses.Count;
-            return neuron.OwnedSynapses[index];
+            int idx = (int)localIndex;
+            int count = neuron.OwnedSynapses.Count;
+
+            // 1. Literal ID (Index) Check
+            if (idx >= 0 && idx < count)
+            {
+                LogTrace("BRIDGE.SYN", $"{apiName}: Found synapse via literal local index {idx}.");
+                return neuron.OwnedSynapses[idx];
+            }
+            else // 2. Relative Modulus Fallback
+            {
+                // This robust modulus handles potential negative inputs correctly.
+                int safeIndex = (idx % count + count) % count;
+                LogTrace("BRIDGE.SYN", $"{apiName}: Literal index {idx} invalid. Used modulus fallback to get synapse at index {safeIndex}.");
+                return neuron.OwnedSynapses[safeIndex];
+            }
         }
 
         #endregion

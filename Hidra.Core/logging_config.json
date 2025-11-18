@@ -1,20 +1,48 @@
 {
+  "experiment_serialization": {
+    "base_output_directory": "Experiments",
+    "name_template": "{name}_{count}_{date}",
+    "run_counter_file": "run_counter.txt"
+  },
   "log_targets": {
-    "console": {
+    "default": {
       "type": "console"
     },
-    "full_capture": {
-      "type": "api"
+    "default_file": {
+      "type": "file",
+      "path": "hidra_log.txt"
     }
   },
   "log_tags": {
-    "SIM_CORE":     { "level": "Debug", "target": "full_capture" },
-    "EVENT_QUEUE":  { "level": "Debug", "target": "full_capture" },
-    "PARSER":       { "level": "Debug", "target": "full_capture" },
-    "NN_BRAIN":     { "level": "Debug", "target": "full_capture" },
-
-    "LOGGER":       { "level": "Info", "target": "console", "color": "Yellow" },
-    "API_ERROR":    { "level": "Error", "target": "console", "color": "Red" },
-    "default":      { "level": "Info", "target": "console" }
+    "default": {
+      "level": "Trace",
+      "target": "default",
+      "color": "Gray"
+    },
+    "BRIDGE.CORE": {
+      "level": "Trace",
+      "target": "default",
+      "color": "Cyan"
+    },
+    "BRIDGE.SENSE": {
+      "level": "Trace",
+      "target": "default",
+      "color": "Magenta"
+    },
+    "BRIDGE.SYN": {
+      "level": "Trace",
+      "target": "default",
+      "color": "Yellow"
+    },
+    "BRIDGE.BRAIN": {
+      "level": "Trace",
+      "target": "default",
+      "color": "Green"
+    },
+    "HGL_TRACE": {
+      "level": "Trace",
+      "target": "default",
+      "color": "DarkGray"
+    }
   }
 }

@@ -63,6 +63,29 @@ namespace Hidra.Core.Logging
             }
         }
 
+        /// <summary>
+        /// Checks if a given log level is enabled for a specific tag.
+        /// This is a performant way to avoid expensive log message construction
+        /// if the message would be discarded anyway.
+        /// </summary>
+        /// <param name="tag">The log tag to check.</param>
+        /// <param name="level">The log level to check.</param>
+        /// <returns>True if logging is enabled for this tag and level, false otherwise.</returns>
+        public static bool IsLogLevelEnabled(string tag, LogLevel level)
+        {
+            if (!_isInitialized) return false;
+
+            if (!_tagConfigs.TryGetValue(tag, out var tagConfig))
+            {
+                if (!_tagConfigs.TryGetValue("default", out tagConfig))
+                {
+                    return false; // No config, no logging
+                }
+            }
+
+            return level >= tagConfig.Level;
+        }
+
         public static void Log(string tag, LogLevel level, string message, string? expId = null)
         {
             if (!_isInitialized) return;

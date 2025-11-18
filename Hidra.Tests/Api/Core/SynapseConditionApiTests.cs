@@ -172,7 +172,7 @@ namespace Hidra.Tests.Api.Core
                 PUSH_CONST 0 0 0
                 CreateNeuron
                 PUSH_CONST 1 0 0
-                CreateNeuron
+                CreateNeuronc
                 PUSH_CONST 1
                 SetSystemTarget
                 PUSH_CONST 0 2 1 1 0

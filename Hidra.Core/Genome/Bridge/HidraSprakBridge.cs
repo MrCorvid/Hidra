@@ -47,6 +47,9 @@ namespace Hidra.Core
         // ------------------------
         // Logging helpers (shared)
         // ------------------------
+        
+        private void LogTrace(string area, string msg)
+            => _world.Log(area, LogLevel.Trace, $"[ctx={_context}] [self={_self?.Id.ToString() ?? "0"}] {msg}");
 
         private void LogDbg(string area, string msg)
             => _world.Log(area, LogLevel.Debug, $"[ctx={_context}] [self={_self?.Id.ToString() ?? "0"}] {msg}");

@@ -104,15 +104,17 @@ namespace Hidra.Core.Logging
     /// </summary>
     public enum LogLevel
     {
+        /// <summary>Highly detailed diagnostic messages, such as instruction-level tracing.</summary>
+        Trace = 0,
         /// <summary>Detailed messages for debugging purposes.</summary>
-        Debug = 0,
+        Debug = 1,
         /// <summary>General informational messages about application flow.</summary>
-        Info = 1,
+        Info = 2,
         /// <summary>Indicates a potential issue that does not prevent current operation.</summary>
-        Warning = 2,
+        Warning = 3,
         /// <summary>An error that prevents a specific operation from completing but allows the application to continue.</summary>
-        Error = 3,
+        Error = 4,
         /// <summary>A critical error that will likely cause the application to terminate.</summary>
-        Fatal = 4
+        Fatal = 5
     }
 }

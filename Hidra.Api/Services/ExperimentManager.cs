@@ -4,6 +4,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using Hidra.Core;
 
 namespace Hidra.API.Services
@@ -14,6 +15,17 @@ namespace Hidra.API.Services
     public class ExperimentManager : IDisposable
     {
         private readonly ConcurrentDictionary<string, Experiment> _experiments = new();
+        private readonly string _baseStoragePath;
+
+        public ExperimentManager()
+        {
+            // Define a root folder for all experiment data
+            _baseStoragePath = Path.Combine(Directory.GetCurrentDirectory(), "_experiments");
+            if (!Directory.Exists(_baseStoragePath))
+            {
+                Directory.CreateDirectory(_baseStoragePath);
+            }
+        }
 
         /// <summary>
         /// Creates a new Experiment instance from a request DTO. The Experiment will
@@ -29,8 +41,9 @@ namespace Hidra.API.Services
 
             var expId = $"exp_{Guid.NewGuid():N}";
             
-            // The Experiment constructor now handles world creation and logger injection.
-            var experiment = new Experiment(expId, request.Name, request);
+            // This call now correctly matches the Experiment constructor.
+            var experimentStoragePath = Path.Combine(_baseStoragePath, expId);
+            var experiment = new Experiment(expId, request.Name, request, experimentStoragePath);
 
             _experiments.TryAdd(expId, experiment);
             return experiment;
@@ -44,8 +57,9 @@ namespace Hidra.API.Services
         {
             var expId = $"exp_{Guid.NewGuid():N}";
             
-            // This constructor correctly wraps the restored world and attaches a new logger.
-            var experiment = new Experiment(expId, request.Name, world);
+            // This call now correctly matches the Experiment constructor.
+            var experimentStoragePath = Path.Combine(_baseStoragePath, expId);
+            var experiment = new Experiment(expId, request.Name, world, experimentStoragePath);
 
             _experiments.TryAdd(expId, experiment);
             return experiment;
@@ -83,6 +97,21 @@ namespace Hidra.API.Services
             if (_experiments.TryRemove(id, out var experiment))
             {
                 experiment.Dispose();
+                
+                // Also delete the persisted data from the filesystem
+                var experimentPath = Path.Combine(_baseStoragePath, id);
+                if (Directory.Exists(experimentPath))
+                {
+                    try
+                    {
+                        Directory.Delete(experimentPath, true);
+                    }
+                    catch (IOException ex)
+                    {
+                        Console.WriteLine($"Error deleting experiment data for {id}: {ex.Message}");
+                    }
+                }
+                
                 return true;
             }
             return false;
@@ -100,4 +129,4 @@ namespace Hidra.API.Services
             _experiments.Clear();
         }
     }
-}
+}   

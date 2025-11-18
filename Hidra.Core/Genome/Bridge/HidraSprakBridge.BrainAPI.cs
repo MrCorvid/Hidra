@@ -9,35 +9,71 @@ namespace Hidra.Core
 {
     public partial class HidraSprakBridge
     {
-        #region Brain API - Type and Global Configuration
+        /// <summary>Finds a brain node using the hybrid lookup strategy.</summary>
+        private NNNode? GetNodeByHybridLookup(NeuralNetworkBrain nnBrain, float nodeId, string apiName)
+        {
+            var network = nnBrain.GetInternalNetwork();
+            if (!network.Nodes.Any())
+            {
+                LogWarn("BRIDGE.BRAIN", $"{apiName}: Target brain has no nodes to select from.");
+                return null;
+            }
 
+            int intNodeId = (int)nodeId;
+
+            // 1. Literal ID Check
+            if (network.Nodes.TryGetValue(intNodeId, out var literalNode))
+            {
+                LogTrace("BRIDGE.BRAIN", $"{apiName}: Found node via literal ID {intNodeId}.");
+                return literalNode;
+            }
+            else // 2. Relative Modulus Fallback
+            {
+                // --- FIX --- Replaced all instances of '.NodeId' with the correct property name '.Id'
+                var orderedNodes = network.Nodes.Values.OrderBy(n => n.Id).ToList();
+                int count = orderedNodes.Count;
+                int safeIndex = (intNodeId % count + count) % count;
+                var fallbackNode = orderedNodes[safeIndex];
+                LogTrace("BRIDGE.BRAIN", $"{apiName}: Literal ID {intNodeId} not found. Used modulus fallback to get node {fallbackNode.Id} at index {safeIndex}.");
+                return fallbackNode;
+            }
+        }
+
+        #region Brain API - Type and Global Configuration
         [SprakAPI("Sets the brain type for the target neuron.", "brain_type (0=NeuralNetwork, 1=LogicGate)")]
         public void API_SetBrainType(float brainType)
         {
+            LogTrace("BRIDGE.BRAIN", $"API_SetBrainType(type={brainType})");
             var target = GetTargetNeuron();
-            LogDbg("BRIDGE.BRAIN", $"API_SetBrainType(type={brainType}) -> target={target?.Id.ToString() ?? "null"}");
             if (target == null) return;
 
             try
             {
+                int intBrainType = (int)brainType;
+                // 1. Literal Enum Check (via switch cases)
+                if (intBrainType < 0 || intBrainType > 1)
+                {
+                    // 2. Modulus Fallback
+                    intBrainType = (intBrainType % 2 + 2) % 2;
+                    LogTrace("BRIDGE.BRAIN", $"Literal brain_type invalid; fell back to {intBrainType}.");
+                }
+
                 IBrain newBrain;
-                switch ((int)brainType)
+                switch (intBrainType)
                 {
                     case 0:
-                        if (target.Brain is NeuralNetworkBrain) { LogDbg("BRIDGE.BRAIN", "Already NeuralNetworkBrain"); return; }
+                        if (target.Brain is NeuralNetworkBrain) return;
                         newBrain = new NeuralNetworkBrain();
                         break;
                     case 1:
-                        if (target.Brain is LogicGateBrain) { LogDbg("BRIDGE.BRAIN", "Already LogicGateBrain"); return; }
+                        if (target.Brain is LogicGateBrain) return;
                         newBrain = new LogicGateBrain();
                         break;
-                    default:
-                        LogWarn("BRIDGE.BRAIN", $"Unknown brain type {(int)brainType}; no-op.");
+                    default: // Should be unreachable due to modulus
                         return;
                 }
                 newBrain.SetPrng(_world.InternalRng);
                 target.Brain = newBrain;
-                LogDbg("BRIDGE.BRAIN", $"Brain set to {newBrain.GetType().Name}");
             }
             catch (Exception ex)
             {
@@ -48,7 +84,7 @@ namespace Hidra.Core
         [SprakAPI("Configures the properties of a LogicGateBrain.", "gate_type", "is_flipflop (0=No, 1=Yes)", "threshold")]
         public void API_ConfigureLogicGate(float gateType, float isFlipFlop, float threshold)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_ConfigureLogicGate(type={gateType}, flipflop={isFlipFlop}, thr={threshold})");
+            LogTrace("BRIDGE.BRAIN", $"API_ConfigureLogicGate(type={gateType}, flipflop={isFlipFlop}, thr={threshold})");
             if (GetTargetNeuron()?.Brain is LogicGateBrain logicBrain)
             {
                 bool useFlipFlop = isFlipFlop >= 1.0f;
@@ -56,31 +92,35 @@ namespace Hidra.Core
 
                 if (useFlipFlop)
                 {
+                    // 1. Literal Enum Check
                     if (Enum.IsDefined(typeof(FlipFlopType), gateTypeValue))
                     {
                         logicBrain.FlipFlop = (FlipFlopType)gateTypeValue;
-                        LogDbg("BRIDGE.BRAIN", $"FlipFlop set to {logicBrain.FlipFlop}");
                     }
-                    else
+                    else // 2. Modulus Fallback
                     {
-                        LogWarn("BRIDGE.BRAIN", $"Invalid FlipFlopType {gateTypeValue}");
+                        var fallbackType = (FlipFlopType)((gateTypeValue % Enum.GetValues(typeof(FlipFlopType)).Length + Enum.GetValues(typeof(FlipFlopType)).Length) % Enum.GetValues(typeof(FlipFlopType)).Length);
+                        logicBrain.FlipFlop = fallbackType;
+                        LogWarn("BRIDGE.BRAIN", $"Invalid FlipFlopType {gateTypeValue}, fell back to {fallbackType}.");
                     }
                 }
                 else
                 {
+                    // 1. Literal Enum Check
                     if (Enum.IsDefined(typeof(LogicGateType), gateTypeValue))
                     {
                         logicBrain.GateType = (LogicGateType)gateTypeValue;
                         logicBrain.FlipFlop = null;
-                        LogDbg("BRIDGE.BRAIN", $"GateType set to {logicBrain.GateType}");
                     }
-                    else
+                    else // 2. Modulus Fallback
                     {
-                        LogWarn("BRIDGE.BRAIN", $"Invalid LogicGateType {gateTypeValue}");
+                        var fallbackType = (LogicGateType)((gateTypeValue % Enum.GetValues(typeof(LogicGateType)).Length + Enum.GetValues(typeof(LogicGateType)).Length) % Enum.GetValues(typeof(LogicGateType)).Length);
+                        logicBrain.GateType = fallbackType;
+                        logicBrain.FlipFlop = null;
+                        LogWarn("BRIDGE.BRAIN", $"Invalid LogicGateType {gateTypeValue}, fell back to {fallbackType}.");
                     }
                 }
                 logicBrain.Threshold = threshold;
-                LogDbg("BRIDGE.BRAIN", $"Threshold set to {threshold}");
             }
             else
             {
@@ -95,47 +135,47 @@ namespace Hidra.Core
         [SprakAPI("Removes all nodes and connections from the target neuron's brain.")]
         public void API_ClearBrain()
         {
+            LogTrace("BRIDGE.BRAIN", "API_ClearBrain()");
             var target = GetTargetNeuron();
-            LogDbg("BRIDGE.BRAIN", $"API_ClearBrain() -> target={target?.Id.ToString() ?? "null"}");
 
             if (target?.Brain is NeuralNetworkBrain nnBrain)
             {
                 nnBrain.GetInternalNetwork().Clear();
-                LogDbg("BRIDGE.BRAIN", "Neural network cleared.");
             }
             else if (target?.Brain is LogicGateBrain lgBrain)
             {
                 lgBrain.ClearInputs();
-                LogDbg("BRIDGE.BRAIN", "Logic gate inputs cleared.");
-            }
-            else
-            {
-                LogWarn("BRIDGE.BRAIN", "No brain present; nothing to clear.");
             }
         }
 
         [SprakAPI("Adds a node to the target neuron's brain.", "node_type (0=Input, 1=Hidden, 2=Output)", "bias")]
         public float API_AddBrainNode(float nodeType, float bias)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_AddBrainNode(type={nodeType}, bias={bias})");
+            LogTrace("BRIDGE.BRAIN", $"API_AddBrainNode(type={nodeType}, bias={bias})");
 
             if (GetTargetNeuron()?.Brain is NeuralNetworkBrain nnBrain)
             {
                 var network = nnBrain.GetInternalNetwork();
                 int nodeTypeValue = (int)nodeType;
-                if (!Enum.IsDefined(typeof(NNNodeType), nodeTypeValue))
-                {
-                    LogWarn("BRIDGE.BRAIN", $"Invalid NNNodeType {nodeTypeValue}; returning -1.");
-                    return -1f;
-                }
+                NNNodeType resolvedType;
 
-                var type = (NNNodeType)nodeTypeValue;
+                // 1. Literal Enum Check
+                if (Enum.IsDefined(typeof(NNNodeType), nodeTypeValue))
+                {
+                    resolvedType = (NNNodeType)nodeTypeValue;
+                }
+                else // 2. Modulus Fallback
+                {
+                    int count = Enum.GetValues(typeof(NNNodeType)).Length;
+                    resolvedType = (NNNodeType)((nodeTypeValue % count + count) % count);
+                    LogWarn("BRIDGE.BRAIN", $"Invalid NNNodeType {nodeTypeValue}, fell back to {resolvedType}.");
+                }
+                
                 int nodeId = network.Nodes.Count > 0 ? network.Nodes.Keys.Max() + 1 : 0;
                 
-                var newNode = new NNNode(nodeId, type) { Bias = bias };
+                var newNode = new NNNode(nodeId, resolvedType) { Bias = bias };
                 network.AddNode(newNode);
-
-                LogDbg("BRIDGE.BRAIN", $"Added NN node id={nodeId}, type={type}, bias={bias}");
+                
                 return nodeId;
             }
 
@@ -146,17 +186,23 @@ namespace Hidra.Core
         [SprakAPI("Adds a connection between two brain nodes.", "src_id", "tgt_id", "weight")]
         public void API_AddBrainConnection(float srcId, float tgtId, float weight)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_AddBrainConnection(src={srcId}, tgt={tgtId}, w={weight})");
+            LogTrace("BRIDGE.BRAIN", $"API_AddBrainConnection(src={srcId}, tgt={tgtId}, w={weight})");
 
             if (GetTargetNeuron()?.Brain is NeuralNetworkBrain nnBrain)
             {
-                var network = nnBrain.GetInternalNetwork();
-                var s = (int)srcId;
-                var t = (int)tgtId;
-                
-                network.AddConnection(new NNConnection(s, t, weight));
+                var sourceNode = GetNodeByHybridLookup(nnBrain, srcId, "API_AddBrainConnection (source)");
+                var targetNode = GetNodeByHybridLookup(nnBrain, tgtId, "API_AddBrainConnection (target)");
 
-                LogDbg("BRIDGE.BRAIN", $"Added NN connection {s}->{t} w={weight}");
+                if (sourceNode != null && targetNode != null)
+                {
+                    var network = nnBrain.GetInternalNetwork();
+                    // --- FIX --- Replaced '.NodeId' with '.Id'
+                    network.AddConnection(new NNConnection(sourceNode.Id, targetNode.Id, weight));
+                }
+                else
+                {
+                    LogWarn("BRIDGE.BRAIN", "Could not resolve one or both nodes for AddBrainConnection; ignored.");
+                }
             }
             else
             {
@@ -171,7 +217,7 @@ namespace Hidra.Core
         [SprakAPI("Constructs a simple, fully-connected feed-forward neural network, clearing any existing brain.", "input_count", "hidden_count", "output_count")]
         public void API_CreateBrain_SimpleFeedForward(float inputCount, float hiddenCount, float outputCount)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_CreateBrain_SimpleFeedForward(in={inputCount}, hidden={hiddenCount}, out={outputCount})");
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_SimpleFeedForward(in={inputCount}, hidden={hiddenCount}, out={outputCount})");
             var target = GetTargetNeuron();
             if (target == null) return;
 
@@ -180,7 +226,6 @@ namespace Hidra.Core
                 var newBrain = new NeuralNetworkBrain();
                 newBrain.SetPrng(_world.InternalRng);
                 target.Brain = newBrain;
-                LogDbg("BRIDGE.BRAIN", "Target was not NeuralNetworkBrain; created a new one.");
             }
             var nnBrain = (NeuralNetworkBrain)target.Brain;
 
@@ -210,14 +255,12 @@ namespace Hidra.Core
             {
                  foreach (var inputId in inputIds) { foreach (var outputId in outputIds) { network.AddConnection(new NNConnection(inputId, outputId, (rng.NextFloat() - 0.5f) * 2f)); } }
             }
-            
-            LogDbg("BRIDGE.BRAIN", $"Built SimpleFeedForward brain with {inputIds.Count} inputs, {hiddenIds.Count} hidden, {outputIds.Count} outputs.");
         }
 
         [SprakAPI("Constructs a competitive (winner-take-all) layer with lateral inhibition, clearing any existing brain.", "input_count", "competitive_count")]
         public void API_CreateBrain_Competitive(float inputCount, float competitiveCount)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_CreateBrain_Competitive(in={inputCount}, comp={competitiveCount})");
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_Competitive(in={inputCount}, comp={competitiveCount})");
             var target = GetTargetNeuron();
             if (target == null) return;
             
@@ -226,7 +269,6 @@ namespace Hidra.Core
                 var newBrain = new NeuralNetworkBrain();
                 newBrain.SetPrng(_world.InternalRng);
                 target.Brain = newBrain;
-                LogDbg("BRIDGE.BRAIN", "Target was not NeuralNetworkBrain; created a new one.");
             }
             var nnBrain = (NeuralNetworkBrain)target.Brain;
 
@@ -244,8 +286,6 @@ namespace Hidra.Core
 
             foreach (var inputId in inputIds) { foreach (var compId in competitiveIds) { network.AddConnection(new NNConnection(inputId, compId, rng.NextFloat())); } }
             foreach (var fromId in competitiveIds) { foreach (var toId in competitiveIds) { if (fromId != toId) { network.AddConnection(new NNConnection(fromId, toId, -1.0f)); } } }
-
-            LogDbg("BRIDGE.BRAIN", $"Built Competitive brain with {inputIds.Count} inputs and {competitiveIds.Count} competing nodes.");
         }
 
         #endregion
@@ -261,32 +301,55 @@ namespace Hidra.Core
         [SprakAPI("Removes a node and its associated connections from the brain.", "node_id")]
         public void API_RemoveBrainNode(float nodeId)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_RemoveBrainNode(nodeId={nodeId})");
+            LogTrace("BRIDGE.BRAIN", $"API_RemoveBrainNode(nodeId={nodeId})");
             if (GetTargetNeuron()?.Brain is NeuralNetworkBrain nnBrain)
             {
-                nnBrain.GetInternalNetwork().RemoveNode((int)nodeId);
+                var nodeToRemove = GetNodeByHybridLookup(nnBrain, nodeId, "API_RemoveBrainNode");
+                if (nodeToRemove != null)
+                {
+                    // --- FIX --- Replaced '.NodeId' with '.Id'
+                    nnBrain.GetInternalNetwork().RemoveNode(nodeToRemove.Id);
+                }
             }
         }
 
         [SprakAPI("Removes a connection between two nodes from the brain.", "from_node_id", "to_node_id")]
         public void API_RemoveBrainConnection(float fromNodeId, float toNodeId)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_RemoveBrainConnection(from={fromNodeId}, to={toNodeId})");
+            LogTrace("BRIDGE.BRAIN", $"API_RemoveBrainConnection(from={fromNodeId}, to={toNodeId})");
             if (GetTargetNeuron()?.Brain is NeuralNetworkBrain nnBrain)
             {
-                nnBrain.GetInternalNetwork().RemoveConnection((int)fromNodeId, (int)toNodeId);
+                var fromNode = GetNodeByHybridLookup(nnBrain, fromNodeId, "API_RemoveBrainConnection (from)");
+                var toNode = GetNodeByHybridLookup(nnBrain, toNodeId, "API_RemoveBrainConnection (to)");
+                if (fromNode != null && toNode != null)
+                {
+                    // --- FIX --- Replaced '.NodeId' with '.Id'
+                    nnBrain.GetInternalNetwork().RemoveConnection(fromNode.Id, toNode.Id);
+                }
             }
         }
 
         [SprakAPI("Configures an output node's action type.", "node_id", "action_type")]
         public void API_ConfigureOutputNode(float nodeId, float actionType)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_ConfigureOutputNode(nodeId={nodeId}, actionType={actionType})");
+            LogTrace("BRIDGE.BRAIN", $"API_ConfigureOutputNode(nodeId={nodeId}, actionType={actionType})");
             if (GetTargetNeuron()?.Brain is not NeuralNetworkBrain nnBrain) return;
 
-            if (nnBrain.GetInternalNetwork().Nodes.TryGetValue((int)nodeId, out var node) && node.NodeType == NNNodeType.Output)
+            var node = GetNodeByHybridLookup(nnBrain, nodeId, "API_ConfigureOutputNode");
+
+            if (node != null && node.NodeType == NNNodeType.Output)
             {
-                var resolvedActionType = (OutputActionType)((int)Math.Abs(actionType) % _outputActionTypeCount);
+                int intActionType = (int)actionType;
+                OutputActionType resolvedActionType;
+
+                if (Enum.IsDefined(typeof(OutputActionType), intActionType))
+                {
+                    resolvedActionType = (OutputActionType)intActionType;
+                }
+                else
+                {
+                    resolvedActionType = (OutputActionType)((intActionType % _outputActionTypeCount + _outputActionTypeCount) % _outputActionTypeCount);
+                }
                 node.ActionType = resolvedActionType;
             }
         }
@@ -294,35 +357,80 @@ namespace Hidra.Core
         [SprakAPI("Maps a brain input node to a data source from the world or neuron.", "node_id", "source_type", "source_index")]
         public void API_SetBrainInputSource(float nodeId, float sourceType, float sourceIndex)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_SetBrainInputSource(nodeId={nodeId}, sourceType={sourceType}, sourceIndex={sourceIndex})");
+            LogTrace("BRIDGE.BRAIN", $"API_SetBrainInputSource(nodeId={nodeId}, sourceType={sourceType}, sourceIndex={sourceIndex})");
             var target = GetTargetNeuron();
             if (target == null) return;
             
-            var resolvedSrcType = (InputSourceType)((int)Math.Abs(sourceType) % _inputSourceTypeCount);
+            int intSourceType = (int)sourceType;
+            InputSourceType resolvedSrcType;
+
+            // First, check if the provided type is a valid, defined enum member.
+            if (Enum.IsDefined(typeof(InputSourceType), intSourceType))
+            {
+                resolvedSrcType = (InputSourceType)intSourceType;
+            }
+            else // If not, fall back to a modulus to guarantee a valid type.
+            {
+                resolvedSrcType = (InputSourceType)((intSourceType % _inputSourceTypeCount + _inputSourceTypeCount) % _inputSourceTypeCount);
+                LogTrace("BRIDGE.BRAIN", $"Literal sourceType {intSourceType} invalid; fell back to {resolvedSrcType}.");
+            }
+            
+            int finalSourceIndex = (int)sourceIndex;
+            int sourceCollectionCount = 0;
+
+            switch (resolvedSrcType)
+            {
+                case InputSourceType.GlobalHormone:
+                    sourceCollectionCount = _world.GetGlobalHormonesDirect().Length;
+                    break;
+                case InputSourceType.LocalVariable:
+                    sourceCollectionCount = target.LocalVariables.Length;
+                    break;
+                case InputSourceType.SynapseValue:
+                    // Use our new public API method to get the count for the modulus.
+                    sourceCollectionCount = _world.GetIncomingSynapses(target).Count;
+                    break;
+            }
+
+            if (sourceCollectionCount > 0)
+            {
+                finalSourceIndex = (finalSourceIndex % sourceCollectionCount + sourceCollectionCount) % sourceCollectionCount;
+            }
 
             if (target.Brain is NeuralNetworkBrain nnBrain)
             {
-                if (nnBrain.GetInternalNetwork().Nodes.TryGetValue((int)nodeId, out var node) && node.NodeType == NNNodeType.Input)
+                var node = GetNodeByHybridLookup(nnBrain, nodeId, "API_SetBrainInputSource");
+                if (node != null && node.NodeType == NNNodeType.Input)
                 {
                     node.InputSource = resolvedSrcType;
-                    node.SourceIndex = (int)sourceIndex;
+                    node.SourceIndex = finalSourceIndex;
                 }
             }
             else if (target.Brain is LogicGateBrain lgBrain)
             {
-                lgBrain.AddInput(resolvedSrcType, (int)sourceIndex);
+                lgBrain.AddInput(resolvedSrcType, finalSourceIndex);
             }
         }
 
         [SprakAPI("Sets the activation function for a specific node in the brain.", "node_id", "function_type")]
         public void API_SetNodeActivationFunction(float nodeId, float functionType)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_SetNodeActivationFunction(nodeId={nodeId}, functionType={functionType})");
+            LogTrace("BRIDGE.BRAIN", $"API_SetNodeActivationFunction(nodeId={nodeId}, functionType={functionType})");
             if (GetTargetNeuron()?.Brain is not NeuralNetworkBrain nnBrain) return;
 
-            if (nnBrain.GetInternalNetwork().Nodes.TryGetValue((int)nodeId, out var node))
+            var node = GetNodeByHybridLookup(nnBrain, nodeId, "API_SetNodeActivationFunction");
+            if (node != null)
             {
-                var resolvedFuncType = (ActivationFunctionType)((int)Math.Abs(functionType) % _activationFunctionTypeCount);
+                int intFuncType = (int)functionType;
+                ActivationFunctionType resolvedFuncType;
+                if (Enum.IsDefined(typeof(ActivationFunctionType), intFuncType))
+                {
+                    resolvedFuncType = (ActivationFunctionType)intFuncType;
+                }
+                else
+                {
+                    resolvedFuncType = (ActivationFunctionType)((intFuncType % _activationFunctionTypeCount + _activationFunctionTypeCount) % _activationFunctionTypeCount);
+                }
                 node.ActivationFunction = resolvedFuncType;
             }
         }
@@ -330,11 +438,17 @@ namespace Hidra.Core
         [SprakAPI("Sets the weight of an existing connection in the brain.", "from_node_id", "to_node_id", "new_weight")]
         public void API_SetBrainConnectionWeight(float fromNodeId, float toNodeId, float newWeight)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_SetBrainConnectionWeight(from={fromNodeId}, to={toNodeId}, weight={newWeight})");
+            LogTrace("BRIDGE.BRAIN", $"API_SetBrainConnectionWeight(from={fromNodeId}, to={toNodeId}, weight={newWeight})");
             if (GetTargetNeuron()?.Brain is not NeuralNetworkBrain nnBrain) return;
+
+            var fromNode = GetNodeByHybridLookup(nnBrain, fromNodeId, "API_SetBrainConnectionWeight (from)");
+            var toNode = GetNodeByHybridLookup(nnBrain, toNodeId, "API_SetBrainConnectionWeight (to)");
+
+            if (fromNode == null || toNode == null) return;
             
+            // --- FIX --- Replaced '.NodeId' with '.Id'
             var connection = nnBrain.GetInternalNetwork().Connections
-                .FirstOrDefault(c => c.FromNodeId == (int)fromNodeId && c.ToNodeId == (int)toNodeId);
+                .FirstOrDefault(c => c.FromNodeId == fromNode.Id && c.ToNodeId == toNode.Id);
                 
             if (connection != null)
             {
@@ -345,12 +459,22 @@ namespace Hidra.Core
         [SprakAPI("Sets a specific property of a node in the brain.", "node_id", "property_id (0=Bias, 1=ActivationFunction)", "value")]
         public void API_SetBrainNodeProperty(float nodeId, float propertyId, float value)
         {
-            LogDbg("BRIDGE.BRAIN", $"API_SetBrainNodeProperty(nodeId={nodeId}, propId={propertyId}, val={value})");
+            LogTrace("BRIDGE.BRAIN", $"API_SetBrainNodeProperty(nodeId={nodeId}, propId={propertyId}, val={value})");
             if (GetTargetNeuron()?.Brain is not NeuralNetworkBrain nnBrain) return;
 
-            if (nnBrain.GetInternalNetwork().Nodes.TryGetValue((int)nodeId, out var node))
+            var node = GetNodeByHybridLookup(nnBrain, nodeId, "API_SetBrainNodeProperty");
+            if (node != null)
             {
-                var prop = (BrainNodeProperty)((int)Math.Abs(propertyId) % _brainNodePropertyCount);
+                int intPropId = (int)propertyId;
+                BrainNodeProperty prop;
+                if (Enum.IsDefined(typeof(BrainNodeProperty), intPropId))
+                {
+                    prop = (BrainNodeProperty)intPropId;
+                }
+                else
+                {
+                    prop = (BrainNodeProperty)((intPropId % _brainNodePropertyCount + _brainNodePropertyCount) % _brainNodePropertyCount);
+                }
                 
                 switch (prop)
                 {
@@ -358,7 +482,16 @@ namespace Hidra.Core
                         node.Bias = value;
                         break;
                     case BrainNodeProperty.ActivationFunction:
-                        var resolvedFuncType = (ActivationFunctionType)((int)Math.Abs(value) % _activationFunctionTypeCount);
+                        int intFuncType = (int)value;
+                        ActivationFunctionType resolvedFuncType;
+                        if (Enum.IsDefined(typeof(ActivationFunctionType), intFuncType))
+                        {
+                            resolvedFuncType = (ActivationFunctionType)intFuncType;
+                        }
+                        else
+                        {
+                            resolvedFuncType = (ActivationFunctionType)((intFuncType % _activationFunctionTypeCount + _activationFunctionTypeCount) % _activationFunctionTypeCount);
+                        }
                         node.ActivationFunction = resolvedFuncType;
                         break;
                 }
@@ -372,18 +505,21 @@ namespace Hidra.Core
         [SprakAPI("Constructs a sparsely connected feed-forward network.", "input_count", "hidden_count", "output_count", "connection_density")]
         public void API_CreateBrain_SparseFeedForward(float a, float b, float c, float d)
         {
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_SparseFeedForward(a={a}, b={b}, c={c}, d={d})");
             LogWarn("BRIDGE.BRAIN", "'API_CreateBrain_SparseFeedForward' is not yet implemented.");
         }
 
         [SprakAPI("Constructs an autoencoder network.", "visible_count", "hidden_count")]
         public void API_CreateBrain_Autoencoder(float a, float b)
         {
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_Autoencoder(a={a}, b={b})");
             LogWarn("BRIDGE.BRAIN", "'API_CreateBrain_Autoencoder' is not yet implemented.");
         }
         
         [SprakAPI("Constructs a feed-forward network with randomized topology.", "input_count", "hidden_count", "output_count", "randomness_factor")]
         public void API_CreateBrain_RandomizedFeedForward(float a, float b, float c, float d)
         {
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_RandomizedFeedForward(a={a}, b={b}, c={c}, d={d})");
             LogWarn("BRIDGE.BRAIN", "'API_CreateBrain_RandomizedFeedForward' is not yet implemented.");
         }
 

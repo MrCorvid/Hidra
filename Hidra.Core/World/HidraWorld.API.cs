@@ -23,6 +23,16 @@ namespace Hidra.Core
         #region Public Getters (Thread-Safe Reads)
 
         /// <summary>
+        /// Gets the total number of genes loaded into the simulation.
+        /// </summary>
+        /// <returns>The total count of compiled genes.</returns>
+        public int GetGeneCount()
+        {
+            // No lock needed as _compiledGenes is immutable after world creation.
+            return _compiledGenes.Count;
+        }
+
+        /// <summary>
         /// Retrieves a neuron by its unique identifier.
         /// </summary>
         /// <param name="id">The ID of the neuron to find.</param>
@@ -45,6 +55,27 @@ namespace Hidra.Core
             lock (_worldApiLock)
             {
                 return _synapses.FirstOrDefault(s => s.Id == id);
+            }
+        }
+
+        // Add this new public method within the "Public Getters" region.
+        /// <summary>
+        /// Retrieves a list of all synapses that target the specified neuron.
+        /// </summary>
+        /// <param name="targetNeuron">The neuron whose incoming synapses are to be found.</param>
+        /// <returns>A new list containing the incoming synapses, sorted by ID.</returns>
+        public List<Synapse> GetIncomingSynapses(Neuron targetNeuron)
+        {
+            lock (_worldApiLock)
+            {
+                // Ensure the cache is up-to-date before using it.
+                EnsureCachesUpToDate(); 
+                if (_incomingSynapseCache != null && _incomingSynapseCache.TryGetValue(targetNeuron.Id, out var synapses))
+                {
+                    // Return a sorted copy to ensure determinism and prevent external modification.
+                    return synapses.OrderBy(s => s.Id).ToList();
+                }
+                return new List<Synapse>();
             }
         }
 
@@ -145,6 +176,29 @@ namespace Hidra.Core
             }
 
             return results;
+        }
+
+        /// <summary>
+        /// Captures and returns a complete, thread-safe snapshot of all entities in the world.
+        /// This method is designed to provide external layers (like an API) with all the data
+        /// needed to build a detailed representation of the world's current state.
+        /// </summary>
+        /// <returns>A <see cref="FullWorldState"/> record containing copies of all world entities.</returns>
+        public FullWorldState GetFullWorldState()
+        {
+            lock (_worldApiLock)
+            {
+                // NOTE: We use .ToList() to create copies of the collections,
+                // preventing the caller from getting a direct reference to the internal lists.
+                return new FullWorldState(
+                    ExperimentId: this.ExperimentId,
+                    CurrentTick: this.CurrentTick,
+                    InputNodes: _inputNodes.Values.ToList(),
+                    OutputNodes: _outputNodes.Values.ToList(),
+                    Neurons: _neurons.Values.ToList(),
+                    Synapses: _synapses.ToList()
+                );
+            }
         }
 
         #endregion
@@ -597,6 +651,20 @@ namespace Hidra.Core
         #endregion
 
         #region Private Helpers
+
+        /// <summary>
+        /// Provides direct, internal access to the live global hormones array.
+        /// This should only be used by trusted internal systems like the HidraSprakBridge
+        /// that need to read intra-tick state changes. The 'internal' keyword ensures
+        /// it is not visible to external assemblies.
+        /// </summary>
+        /// <returns>A direct reference to the GlobalHormones array.</returns>
+        internal float[] GetGlobalHormonesDirect()
+        {
+            // This method intentionally bypasses the defensive clone for performance
+            // and to allow reading of live state within a single tick.
+            return this.GlobalHormones;
+        }
 
         /// <summary>
         /// Gets a snapshot of all neuron IDs, sorted for deterministic ordering.

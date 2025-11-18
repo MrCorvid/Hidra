@@ -1,9 +1,9 @@
-// --- START OF FILE AssemblerController.cs ---
 // In Hidra.API/Controllers/AssemblerController.cs
 
 using Microsoft.AspNetCore.Mvc;
 using Hidra.API.Services;
 using static Hidra.API.Services.HglAssemblerService; // For HglAssemblyException
+using System; // For Exception
 
 namespace Hidra.API.Controllers
 {
@@ -19,18 +19,32 @@ namespace Hidra.API.Controllers
         public string HexBytecode { get; set; } = "";
     }
 
+    // DTO for the decompile request
+    public class DecompileRequestDto
+    {
+        public required string HexBytecode { get; set; }
+    }
+
+    // DTO for the decompile response
+    public class DecompileResponseDto
+    {
+        public string SourceCode { get; set; } = "";
+    }
+
     /// <summary>
-    /// Provides an endpoint to compile HGL assembly language into bytecode.
+    /// Provides endpoints to compile HGL assembly into bytecode and decompile bytecode back into assembly.
     /// </summary>
     [ApiController]
     [Route("api/assembler")]
     public class AssemblerController : ControllerBase
     {
         private readonly HglAssemblerService _assembler;
+        private readonly HglDecompilerService _decompiler;
 
-        public AssemblerController(HglAssemblerService assembler)
+        public AssemblerController(HglAssemblerService assembler, HglDecompilerService decompiler)
         {
             _assembler = assembler;
+            _decompiler = decompiler;
         }
 
         /// <summary>
@@ -64,6 +78,33 @@ namespace Hidra.API.Controllers
                  return BadRequest(new ProblemDetails
                 {
                     Title = "An unexpected error occurred during assembly.",
+                    Detail = ex.Message,
+                    Status = StatusCodes.Status400BadRequest
+                });
+            }
+        }
+
+        /// <summary>
+        /// Decompiles a hexadecimal bytecode string into human-readable HGL assembly source code.
+        /// </summary>
+        /// <param name="request">A DTO containing the HGL hexadecimal bytecode.</param>
+        /// <returns>A 200 OK with the decompiled source code, or a 400 Bad Request if decompilation fails.</returns>
+        [HttpPost("decompile")]
+        [ProducesResponseType(typeof(DecompileResponseDto), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
+        public IActionResult Decompile([FromBody] DecompileRequestDto request)
+        {
+            try
+            {
+                string sourceCode = _decompiler.Decompile(request.HexBytecode);
+                return Ok(new DecompileResponseDto { SourceCode = sourceCode });
+            }
+            catch (Exception ex)
+            {
+                // Catch any unexpected errors during decompilation.
+                return BadRequest(new ProblemDetails
+                {
+                    Title = "An unexpected error occurred during decompilation.",
                     Detail = ex.Message,
                     Status = StatusCodes.Status400BadRequest
                 });

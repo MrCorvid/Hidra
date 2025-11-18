@@ -299,18 +299,20 @@ namespace Hidra.Core
                 }
             }
 
+            ulong completedTick = CurrentTick;  // The tick that just finished executing
+            
             lock (_eventHistoryLock)
             {
-                if (!_eventHistory.TryGetValue(CurrentTick, out var bucket))
+                if (!_eventHistory.TryGetValue(completedTick, out var bucket))
                 {
                     bucket = new List<Event>(_currentTickPulses.Count + _currentTickOtherEvents.Count);
-                    _eventHistory[CurrentTick] = bucket;
+                    _eventHistory[completedTick] = bucket;  // Use completedTick instead of CurrentTick
                 }
                 bucket.AddRange(_currentTickPulses);
                 bucket.AddRange(_currentTickOtherEvents);
             }
             
-            CurrentTick++;
+            CurrentTick++;  // Advance to next tick AFTER archiving
         }
 
         #endregion
@@ -519,20 +521,52 @@ namespace Hidra.Core
         /// </summary>
         private float GetValueForBrainInput(BrainInput brainInput, Neuron neuron, float activationPotential)
         {
-            const int LVAR_COUNT = 256;
-            return brainInput.SourceType switch
+            const int LVAR_COUNT = 256; // Assuming this constant is available or defined elsewhere
+            switch (brainInput.SourceType)
             {
-                InputSourceType.ActivationPotential => activationPotential,
-                InputSourceType.CurrentPotential => neuron.GetPotential(),
-                InputSourceType.Health => neuron.LocalVariables[(int)LVarIndex.Health],
-                InputSourceType.Age => neuron.LocalVariables[(int)LVarIndex.Age],
-                InputSourceType.FiringRate => neuron.LocalVariables[(int)LVarIndex.FiringRate],
-                InputSourceType.LocalVariable => (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < LVAR_COUNT) ? neuron.LocalVariables[brainInput.SourceIndex] : 0f,
-                InputSourceType.GlobalHormone => (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < GlobalHormones.Length) ? GlobalHormones[brainInput.SourceIndex] : 0f,
-                InputSourceType.ConstantOne => 1.0f,
-                InputSourceType.ConstantZero => 0.0f,
-                _ => 0f,
-            };
+                case InputSourceType.ActivationPotential:
+                    return activationPotential;
+                case InputSourceType.CurrentPotential:
+                    return neuron.GetPotential();
+                case InputSourceType.Health:
+                    return neuron.LocalVariables[(int)LVarIndex.Health];
+                case InputSourceType.Age:
+                    return neuron.LocalVariables[(int)LVarIndex.Age];
+                case InputSourceType.FiringRate:
+                    return neuron.LocalVariables[(int)LVarIndex.FiringRate];
+                case InputSourceType.LocalVariable:
+                    return (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < LVAR_COUNT) ? neuron.LocalVariables[brainInput.SourceIndex] : 0f;
+                case InputSourceType.GlobalHormone:
+                    return (brainInput.SourceIndex >= 0 && brainInput.SourceIndex < GlobalHormones.Length) ? GlobalHormones[brainInput.SourceIndex] : 0f;
+                case InputSourceType.ConstantOne:
+                    return 1.0f;
+                case InputSourceType.ConstantZero:
+                    return 0.0f;
+
+                // --- START OF NEW IMPLEMENTATION ---
+                case InputSourceType.SynapseValue:
+                {
+                    // The cache contains all synapses where the target is this neuron.
+                    if (_incomingSynapseCache != null && _incomingSynapseCache.TryGetValue(neuron.Id, out var incomingSynapses))
+                    {
+                        // Ensure deterministic order by sorting by Synapse ID before indexing.
+                        incomingSynapses.Sort((a, b) => a.Id.CompareTo(b.Id));
+                        
+                        int synapseIndex = brainInput.SourceIndex;
+                        if (synapseIndex >= 0 && synapseIndex < incomingSynapses.Count)
+                        {
+                            // Read the value from the PREVIOUS tick to ensure deterministic, order-independent evaluation.
+                            return incomingSynapses[synapseIndex].PreviousSourceValue;
+                        }
+                    }
+                    // If the index is invalid or the neuron has no incoming synapses, return 0.
+                    return 0f;
+                }
+                // --- END OF NEW IMPLEMENTATION ---
+
+                default:
+                    return 0f;
+            }
         }
         
         /// <summary>

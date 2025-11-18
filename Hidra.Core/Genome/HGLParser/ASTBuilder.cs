@@ -1,360 +1,242 @@
 // Hidra.Core/ASTBuilder.cs
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
-using System.Text;
 using Hidra.Core.Logging;
 using ProgrammingLanguageNr1;
 
 namespace Hidra.Core
 {
-    /// <summary>
-    /// Builds a Sprak AST from HGL decompiled instructions.
-    /// This builder targets the node shapes expected by SprakRunner/InterpreterTwo:
-    /// PROGRAM_ROOT
-    ///   ├── STATEMENT_LIST "<GENE>"
-    ///   │   └── STATEMENT_LIST "<GLOBAL_VARIABLE_DEFINITIONS_LIST>"   (must be the first child)
-    ///   └── STATEMENT_LIST "<FUNCTION_DECLARATIONS>"
-    ///
-    /// Function calls are emitted as:
-    ///   FUNCTION_CALL
-    ///     ├── NAME("API_Foo")
-    ///     └── NODE_GROUP "<ARGS>" (arg0, arg1, ...)
-    ///
-    /// IF statements are emitted as AST_IfNode with children:
-    ///   IF
-    ///     ├── <condition expr>
-    ///     ├── STATEMENT_LIST "<THEN>"
-    ///     └── STATEMENT_LIST "<ELSE>" (optional)
-    /// </summary>
     public sealed class ASTBuilder
     {
-        private const string ArgsTag = "<ARGS>";
-        private const string ThenTag = "<THEN>";
-        private const string ElseTag = "<ELSE>";
+        #region Private Helper Classes
 
-        private Action<string, LogLevel, string>? _logger;
-        private int _tempVarCounter; // Counter for generating unique temporary variable names.
-
-        private string DumpStack(BlockCtx ctx)
-        {
-            if (ctx.Stack.Count == 0) return "[]";
-            var sb = new StringBuilder();
-            sb.Append("[ ");
-            sb.Append(string.Join(", ", ctx.Stack.Select(n => n.getTokenString())));
-            sb.Append(" ]");
-            return sb.ToString();
-        }
-
-        private void Log(string area, LogLevel level, string message)
-        {
-            _logger?.Invoke(area, level, message);
-        }
-
-        private sealed class BlockCtx
+        private class AstBuildContext
         {
             public readonly HGLDecompiler.DecompileResult DR;
-            public readonly List<AST> Stack;
             public readonly Dictionary<string, MethodInfo> ApiMethodsByName;
-            public BlockCtx(HGLDecompiler.DecompileResult dr, Dictionary<string, MethodInfo> apiMethodsByName)
+            public readonly Dictionary<int, string> Labels = new();
+            public int NextLabelId = 0;
+
+            public AstBuildContext(HGLDecompiler.DecompileResult dr, Dictionary<string, MethodInfo> apiMethodsByName)
             {
                 DR = dr;
                 ApiMethodsByName = apiMethodsByName;
-                Stack = new List<AST>(8);
+
+                foreach (var targetIndex in dr.JumpTargets.Keys.OrderBy(k => k))
+                {
+                    GetLabelForInstruction(targetIndex);
+                }
+            }
+
+            public string GetLabelForInstruction(int instructionIndex)
+            {
+                if (!Labels.TryGetValue(instructionIndex, out var label))
+                {
+                    label = $"LBL_{NextLabelId++}";
+                    Labels[instructionIndex] = label;
+                }
+                return label;
             }
         }
 
+        #endregion
+
+        private const string ArgsTag = "<ARGS>";
+        private Action<string, LogLevel, string>? _logger;
+        private int _tempVarCounter;
+
+        private void Log(string area, LogLevel level, string message) => _logger?.Invoke(area, level, string.Concat("[ASTBuilder] ", message));
+
         public AST BuildAst(HGLDecompiler.DecompileResult dr,
-                    Dictionary<string, MethodInfo> apiMethodsByName,
-                    Action<string, LogLevel, string>? logger = null)
+                            Dictionary<string, MethodInfo> apiMethodsByName,
+                            Action<string, LogLevel, string>? logger = null)
         {
             _logger = logger;
-            _tempVarCounter = 0; // Reset for each gene parse.
+            _tempVarCounter = 0;
+            var ctx = new AstBuildContext(dr, apiMethodsByName);
             var geneStatements = new AST(new Token(Token.TokenType.STATEMENT_LIST, "<GENE>"));
-            var ctx = new BlockCtx(dr, apiMethodsByName);
-            BuildBlock(ctx, 0, dr.Instructions.Count, geneStatements, "gene");
+
+            if (dr.Instructions.Count == 0) return geneStatements;
+            
+            BuildGeneBody(ctx, geneStatements);
+
             return geneStatements;
         }
 
-        private static bool IsConditional(byte opcode) => opcode == HGLOpcodes.JZ || opcode == HGLOpcodes.JNZ;
-
-        private static bool IsApiOpcode(byte opcode)
+        private void BuildGeneBody(AstBuildContext ctx, AST outList)
         {
-            int start = HGLOpcodes.ApiOpcodeStart;
-            int end = HGLOpcodes.OperatorOpcodeStart; // API opcodes are between ApiOpcodeStart and OperatorOpcodeStart
-            return opcode >= start && opcode < end;
-        }
+            var virtualStack = new List<AST>();
+            int instructionCount = ctx.DR.Instructions.Count;
 
-        private static string GetApiNameFromOpcode(byte opcode)
-        {
-            // Use the opcode lookup to get the instruction name
-            var instructionName = HGLOpcodes.MasterInstructionOrder.ElementAtOrDefault(opcode);
-            if (instructionName != null && instructionName.StartsWith("API_"))
+            for (int i = 0; i < instructionCount; i++)
             {
-                return instructionName;
-            }
-            return $"API_UNKNOWN_{opcode}";
-        }
-
-        private static string OpcodeToOperator(byte opcode)
-        {
-            if (opcode == HGLOpcodes.ADD) return "+";
-            if (opcode == HGLOpcodes.SUB) return "-";
-            if (opcode == HGLOpcodes.MUL) return "*";
-            if (opcode == HGLOpcodes.DIV) return "/";
-            if (opcode == HGLOpcodes.MOD) return "%";
-            if (opcode == HGLOpcodes.EQ) return "==";
-            if (opcode == HGLOpcodes.NEQ) return "!=";
-            if (opcode == HGLOpcodes.GT) return ">";
-            if (opcode == HGLOpcodes.LT) return "<";
-            if (opcode == HGLOpcodes.GTE) return ">=";
-            if (opcode == HGLOpcodes.LTE) return "<=";
-            return "?";
-        }
-
-        private static AST Pop(BlockCtx ctx)
-        {
-            var node = ctx.Stack[^1];
-            ctx.Stack.RemoveAt(ctx.Stack.Count - 1);
-            return node;
-        }
-
-        private void FlushStackAsStatements(BlockCtx ctx, AST outList, string reason)
-        {
-            while (ctx.Stack.Count > 0)
-            {
-                var n = Pop(ctx);
-                outList.addChild(n);
-            }
-        }
-
-        private static int? TargetOf(BlockCtx ctx, int condIndex)
-        {
-            object? js = ctx.DR.JumpSources;
-            if (js is int[] arr)
-            {
-                if (condIndex >= 0 && condIndex < arr.Length)
+                if (ctx.Labels.ContainsKey(i))
                 {
-                    int t = arr[condIndex];
-                    if (t >= 0) return t;
-                }
-                return null;
-            }
-            if (js is System.Collections.Generic.Dictionary<int, int> dict)
-            {
-                return dict.TryGetValue(condIndex, out int t) ? t : (int?)null;
-            }
-            return null;
-        }
-
-        private AST WrapWithNot(AST conditionExpr)
-        {
-            var notToken = new Token(Token.TokenType.NOT, "NOT");
-            var notNode = new AST(notToken);
-            notNode.addChild(conditionExpr);
-            return notNode;
-        }
-
-        private static string NormalizeApiName(string rawName)
-        {
-            if (string.IsNullOrEmpty(rawName)) return rawName ?? string.Empty;
-            return rawName.StartsWith("API_", StringComparison.Ordinal) ? rawName.Substring(4) : rawName;
-        }
-
-        private void BuildBlock(BlockCtx ctx, int start, int end, AST outList, string dbg)
-        {
-            Log("PARSER", LogLevel.Debug, $"BuildBlock started. Range: [{start}, {end}). Stack depth: {ctx.Stack.Count}");
-            int i = start;
-            while (i < end)
-            {
-                var ins = ctx.DR.Instructions[i];
-                
-                Log("PARSER", LogLevel.Debug, $"--> Processing Instruction [Index {i}]: {ins}");
-                Log("PARSER", LogLevel.Debug, $"    Stack Before: {DumpStack(ctx)}");
-
-                if (IsConditional(ins.Opcode))
-                {
-                    if (TryParseIf(ctx, i, end, out int nextI, out AST? ifNode))
-                    {
-                        FlushStackAsStatements(ctx, outList, "before-if");
-                        outList.addChild(ifNode!);
-                        i = nextI;
-                        continue;
-                    }
+                    outList.addChild(new AST(new Token(Token.TokenType.LABEL, ctx.GetLabelForInstruction(i))));
                 }
 
-                if (ins.Opcode == HGLOpcodes.PUSH_BYTE)
+                var instr = ctx.DR.Instructions[i];
+
+                if (IsConditionalJump(instr.Opcode))
                 {
-                    float value = (float)ins.Operand;
-                    string valueString = value.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                    var lit = new TokenWithValue(Token.TokenType.NUMBER, valueString, value);
-                    ctx.Stack.Add(new AST(lit));
-                }
-                else if (ins.Opcode == HGLOpcodes.DUP)
-                {
-                    if (ctx.Stack.Count == 0)
-                        ctx.Stack.Add(new AST(new TokenWithValue(Token.TokenType.NUMBER, "0", 0f)));
-                    else
-                        ctx.Stack.Add(ctx.Stack[^1]);
-                }
-                else if (ins.Opcode == HGLOpcodes.POP)
-                {
-                    if (ctx.Stack.Count > 0)
-                    {
-                        var node = Pop(ctx);
-                        Log("PARSER", LogLevel.Debug, $"    POP: Flushing '{node.getTokenString()}' to statements.");
-                        outList.addChild(node);
-                    }
-                }
-                else if (ins.Opcode >= HGLOpcodes.ADD && ins.Opcode <= HGLOpcodes.LTE)
-                {
-                    while (ctx.Stack.Count < 2)
-                        ctx.Stack.Add(new AST(new TokenWithValue(Token.TokenType.NUMBER, "0", 0f)));
-                    var rhs = Pop(ctx);
-                    var lhs = Pop(ctx);
-                    string opStr = OpcodeToOperator(ins.Opcode);
-                    var opNode = new AST(new Token(Token.TokenType.OPERATOR, opStr));
-                    opNode.addChild(lhs);
-                    opNode.addChild(rhs);
-                    ctx.Stack.Add(opNode);
-                }
-                else if (IsApiOpcode(ins.Opcode))
-                {
-                    // Get the API method name from the opcode using name-based lookup
-                    string apiInstructionName = GetApiNameFromOpcode(ins.Opcode);
+                    int? targetIndex = GetJumpTargetIndex(ctx, i);
+                    if (!targetIndex.HasValue) continue;
+
+                    string targetLabel = ctx.GetLabelForInstruction(targetIndex.Value);
                     
-                    // Look up the actual method by name
-                    ctx.ApiMethodsByName.TryGetValue(apiInstructionName, out MethodInfo? apiMethod);
-                    
-                    string rawName = apiMethod?.Name ?? apiInstructionName;
-                    string apiName = NormalizeApiName(rawName);
-                    int argCount = apiMethod?.GetParameters().Length ?? 0;
-                    
-                    var args = new List<AST>(argCount);
-                    for (int a = 0; a < argCount; a++)
+                    AST condition = Pop(virtualStack);
+
+                    // Translate HGL opcodes into generic interpreter logic.
+                    // The interpreter only knows one operation: IF_GOTO (which jumps on true).
+                    // For JZ (jump if false), we must invert the condition before giving it to the node.
+                    if (instr.Opcode == HGLOpcodes.JZ)
                     {
-                        args.Add(ctx.Stack.Count > 0
-                            ? Pop(ctx)
-                            : new AST(new TokenWithValue(Token.TokenType.NUMBER, "0", 0f)));
+                        var notNode = new AST(new Token(Token.TokenType.NOT, "!"));
+                        notNode.addChild(condition);
+                        condition = notNode;
                     }
-                    args.Reverse();
 
-                    var argsGroup = new AST(new Token(Token.TokenType.NODE_GROUP, ArgsTag));
-                    foreach (var a in args) argsGroup.addChild(a);
-                    
-                    var callNode = new AST_FunctionCall(new Token(Token.TokenType.FUNCTION_CALL, apiName));
-                    callNode.addChild(argsGroup);
+                    var ifGotoToken = new Token(Token.TokenType.IF_GOTO, "IF_GOTO");
+                    var ifGotoNode = new AST_IfGotoNode(ifGotoToken, targetLabel);
+                    ifGotoNode.addChild(condition);
 
-                    bool isVoid = apiMethod?.ReturnType == typeof(void);
+                    outList.addChild(ifGotoNode);
+                }
+                else if (instr.Opcode == HGLOpcodes.JMP)
+                {
+                    int? targetIndex = GetJumpTargetIndex(ctx, i);
+                    if (!targetIndex.HasValue) continue;
 
-                    if (isVoid)
-                    {
-                        Log("PARSER", LogLevel.Debug, $"    Action: Adding void call '{callNode.getTokenString()}' to statements.");
-                        outList.addChild(callNode);
-                    }
-                    else
-                    {
-                        string tempVarName = $"__t{_tempVarCounter++}";
-                        var nameToken = new Token(Token.TokenType.NAME, tempVarName);
-
-                        var declarationNode = new AST_VariableDeclaration(
-                            new Token(Token.TokenType.VAR_DECLARATION, "<IMPLICIT_TEMP_VAR>"),
-                            ReturnValueType.UNKNOWN_TYPE,
-                            tempVarName
-                        );
-                        var assignmentNode = new AST_Assignment(
-                            new Token(Token.TokenType.ASSIGNMENT, "="),
-                            tempVarName
-                        );
-                        assignmentNode.addChild(callNode);
-
-                        Log("PARSER", LogLevel.Debug, $"    Action: Adding non-void call '{callNode.getTokenString()}' as assignment to '{tempVarName}'.");
-                        outList.addChild(declarationNode);
-                        outList.addChild(assignmentNode);
-
-                        var variableNode = new AST_Variable(nameToken);
-                        Log("PARSER", LogLevel.Debug, $"    Action: Pushing result '{variableNode.getTokenString()}' onto stack.");
-                        ctx.Stack.Add(variableNode);
-                    }
+                    string targetLabel = ctx.GetLabelForInstruction(targetIndex.Value);
+                    outList.addChild(new AST(new Token(Token.TokenType.GOTO, targetLabel)));
                 }
                 else
                 {
-                    Log("PARSER", LogLevel.Warning, $"Unknown/unsupported opcode 0x{ins.Opcode:X2} at {i}. Ignored.");
+                    ProcessInstruction(ctx, instr, virtualStack, outList);
                 }
-
-                Log("PARSER", LogLevel.Debug, $"    Stack After:  {DumpStack(ctx)}");
-                i += 1;
             }
-            FlushStackAsStatements(ctx, outList, "block-end");
-            Log("PARSER", LogLevel.Debug, $"BuildBlock finished. Range: [{start}, {end}). Final statement count: {outList.getChildren().Count}");
-        }
-
-        private bool TryParseIf(BlockCtx ctx, int condIndex, int blockEndExclusive,
-                                out int nextIndex, out AST? ifNode)
-        {
-            nextIndex = condIndex + 1;
-            ifNode = null;
-            var condInstr = ctx.DR.Instructions[condIndex];
-
-            // The condition should be on the stack from the preceding instruction(s)
-            AST condition = ctx.Stack.Count > 0
-                ? Pop(ctx)
-                : new AST(new TokenWithValue(Token.TokenType.NUMBER, "0", 0f));
-
-            int? target = TargetOf(ctx, condIndex);
-            if (target == null) return false;
-
-            var ifAst = new AST_IfNode(new Token(Token.TokenType.IF, "if"));
-            int thenStart = condIndex + 1;
             
-            int jmpIndex = target.Value - 1;
-            if (jmpIndex >= thenStart && jmpIndex < blockEndExclusive && ctx.DR.Instructions[jmpIndex].Opcode == HGLOpcodes.JMP)
+            foreach(var remainingExpression in virtualStack)
             {
-                int? endTarget = TargetOf(ctx, jmpIndex);
-                if (endTarget != null && endTarget.Value > target.Value && endTarget.Value <= blockEndExclusive)
+                outList.addChild(remainingExpression);
+            }
+        }
+
+        private void ProcessInstruction(AstBuildContext ctx, HGLDecompiler.Instruction instr, List<AST> stack, AST outList)
+        {
+             try
+            {
+                byte op = instr.Opcode;
+
+                if (op == HGLOpcodes.PUSH_BYTE)
                 {
-                    var thenList = new AST(new Token(Token.TokenType.STATEMENT_LIST, ThenTag));
-                    BuildBlock(ctx, thenStart, jmpIndex, thenList, "if-else then");
-
-                    var elseList = new AST(new Token(Token.TokenType.STATEMENT_LIST, ElseTag));
-                    BuildBlock(ctx, target.Value, endTarget.Value, elseList, "if-else else");
-
-                    // JZ jumps if the condition is false/zero, so the 'then' block executes when the condition is true.
-                    // This means the IF condition should be NOT(condition).
-                    // JNZ jumps if the condition is true/non-zero, so the 'then' block executes when false.
-                    // This means the IF condition should be the condition as-is.
-                    // The original code seems to have this backwards for an if-else structure where the jump goes to the ELSE block.
-                    // Let's assume JZ jumps over the THEN block to the ELSE.
-                    // The THEN block runs if condition is NON-ZERO. So the 'if' condition is `condition`.
-                    // To make `JZ` work, the compiler should have put a `NOT` before it.
-                    // Sticking to standard compilation: JZ branches when false. The code following is the TRUE block.
-                    // JZ target: `if (condition==0) goto target`. Block after JZ is the THEN block. Condition to run THEN is `condition != 0`. So for JZ, if condition is `!condition`
-                    ifAst.addChild(condInstr.Opcode == HGLOpcodes.JZ ? WrapWithNot(condition) : condition);
-                    ifAst.addChild(thenList);
-                    ifAst.addChild(elseList);
-
-                    ifNode = ifAst;
-                    nextIndex = endTarget.Value;
-                    return true;
+                    float byteValue = (float)instr.Operand;
+                    stack.Add(new AST(new TokenWithValue(Token.TokenType.NUMBER, byteValue.ToString(CultureInfo.InvariantCulture), byteValue)));
+                }
+                else if (op == HGLOpcodes.PUSH_FLOAT)
+                {
+                    float floatValue = BitConverter.ToSingle(BitConverter.GetBytes(instr.Operand), 0);
+                    stack.Add(new AST(new TokenWithValue(Token.TokenType.NUMBER, floatValue.ToString(CultureInfo.InvariantCulture), floatValue)));
+                }
+                else if (op == HGLOpcodes.DUP)
+                {
+                    if (stack.Count > 0) stack.Add(stack.Last().Clone());
+                    else stack.Add(new AST(new TokenWithValue(Token.TokenType.NUMBER, "0", 0f)));
+                }
+                else if (op == HGLOpcodes.POP)
+                {
+                    if (stack.Count > 0) outList.addChild(Pop(stack));
+                }
+                else if (op >= HGLOpcodes.ADD && op <= HGLOpcodes.LTE)
+                {
+                    var rhs = Pop(stack);
+                    var lhs = Pop(stack);
+                    var opNode = new AST(new Token(Token.TokenType.OPERATOR, OpcodeToOperator(instr.Opcode)));
+                    opNode.addChild(lhs);
+                    opNode.addChild(rhs);
+                    stack.Add(opNode);
+                }
+                else if (IsApiOpcode(op))
+                {
+                    BuildApiCall(ctx, instr.Opcode, stack, outList);
                 }
             }
-
-            int thenEnd = target.Value;
-            if (thenEnd < thenStart || thenEnd > blockEndExclusive) return false;
-
-            var thenOnlyList = new AST(new Token(Token.TokenType.STATEMENT_LIST, ThenTag));
-            BuildBlock(ctx, thenStart, thenEnd, thenOnlyList, "if-then");
-            
-            // For a simple IF-THEN, the jump skips the THEN block.
-            // JZ target: `if (condition==0) goto target`. The THEN block is skipped. The condition to EXECUTE the THEN block is `condition != 0`. So for JZ, the AST condition is `condition`.
-            // JNZ target: `if (condition!=0) goto target`. The THEN block is skipped. The condition to EXECUTE the THEN block is `condition == 0`. So for JNZ, the AST condition is `!condition`.
-            ifAst.addChild(condInstr.Opcode == HGLOpcodes.JNZ ? WrapWithNot(condition) : condition);
-            ifAst.addChild(thenOnlyList);
-
-            ifNode = ifAst;
-            nextIndex = thenEnd;
-            return true;
+            catch (Exception ex)
+            {
+                Log("AST_BUILD", LogLevel.Error, $"Error processing instruction at {instr.ByteOffset}: {ex.Message}. Inserting placeholder.");
+                outList.addChild(new AST(new Token(Token.TokenType.NAME, "<ERROR_PLACEHOLDER>")));
+            }
         }
+
+        #region Shared Helpers
+
+        private static bool IsApiOpcode(byte opcode) => opcode >= HGLOpcodes.ApiOpcodeStart && opcode < HGLOpcodes.OperatorOpcodeStart;
+        
+        private static bool IsConditionalJump(byte opcode) => 
+            opcode == HGLOpcodes.JZ  || 
+            opcode == HGLOpcodes.JNZ || 
+            opcode == HGLOpcodes.JNE;
+
+        private static string GetApiNameFromOpcode(byte opcode) => HGLOpcodes.MasterInstructionOrder.ElementAtOrDefault(opcode) ?? $"API_UNKNOWN_{opcode}";
+        private static int? GetJumpTargetIndex(AstBuildContext ctx, int instrIndex) => (instrIndex >= 0 && instrIndex < ctx.DR.JumpSources.Length && ctx.DR.JumpSources[instrIndex] >= 0) ? ctx.DR.JumpSources[instrIndex] : null;
+        
+        private static AST Pop(List<AST> stack)
+        {
+            if (stack.Count == 0)
+            {
+                return new AST(new TokenWithValue(Token.TokenType.NUMBER, "0", 0f));
+            }
+            var node = stack.Last();
+            stack.RemoveAt(stack.Count - 1);
+            return node;
+        }
+
+        private void BuildApiCall(AstBuildContext ctx, byte opcode, List<AST> stack, AST outList)
+        {
+            string apiInstructionName = GetApiNameFromOpcode(opcode);
+            ctx.ApiMethodsByName.TryGetValue(apiInstructionName, out MethodInfo? apiMethod);
+
+            string rawName = apiMethod?.Name ?? apiInstructionName;
+            string apiName = NormalizeApiName(rawName);
+            int argCount = apiMethod?.GetParameters().Length ?? 0;
+
+            var args = new List<AST>(argCount);
+            for (int a = 0; a < argCount; a++)
+                args.Add(Pop(stack));
+            args.Reverse();
+
+            var argsGroup = new AST(new Token(Token.TokenType.NODE_GROUP, ArgsTag));
+            foreach (var a in args) argsGroup.addChild(a);
+
+            var callNode = new AST_FunctionCall(new Token(Token.TokenType.FUNCTION_CALL, apiName));
+            callNode.addChild(argsGroup);
+
+            if (apiMethod == null || apiMethod.ReturnType == typeof(void))
+            {
+                outList.addChild(callNode);
+            }
+            else
+            {
+                ReturnValueType rvType = ReturnValueConversions.SystemTypeToReturnValueType(apiMethod.ReturnType);
+
+                string tempVarName = $"__t{_tempVarCounter++}";
+                var declarationNode = new AST_VariableDeclaration(new Token(Token.TokenType.VAR_DECLARATION, "<IMPLICIT>"), rvType, tempVarName);
+                var assignmentNode = new AST_Assignment(new Token(Token.TokenType.ASSIGNMENT, "="), tempVarName);
+                assignmentNode.addChild(callNode);
+
+                outList.addChild(declarationNode);
+                outList.addChild(assignmentNode);
+
+                stack.Add(new AST_Variable(new Token(Token.TokenType.NAME, tempVarName)));
+            }
+        }
+
+        private static string OpcodeToOperator(byte opcode) => HGLOpcodes.OperatorLookup.FirstOrDefault(x => x.Value == opcode).Key ?? "?";
+        private static string NormalizeApiName(string rawName) => rawName.StartsWith("API_", StringComparison.Ordinal) ? rawName.Substring(4) : rawName;
+
+        #endregion
     }
 }

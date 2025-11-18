@@ -1,4 +1,11 @@
 {
-  "InputNodeIds": [ 100, 101, 102 ],
-  "OutputNodeIds": [ 200, 201 ]
+  "InputNodeIds": [
+    100,
+    101,
+    102
+  ],
+  "OutputNodeIds": [
+    200,
+    201
+  ]
 }

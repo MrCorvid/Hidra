@@ -1,6 +1,7 @@
 // Hidra.API/Services/HglAssemblerService.cs
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 using Hidra.API.DTOs;
@@ -8,12 +9,12 @@ using Hidra.API.DTOs;
 namespace Hidra.API.Services
 {
     /// <summary>
-    /// Assembles human-readable HGL into bytecode using a two-pass approach with labels.
-    /// This is robust against code changes and easier for humans to author.
+    /// Assembles human-readable HGL into bytecode using a two-pass approach.
+    /// - Supports labels for jump targets (e.g., 'MY_LABEL:').
     /// - Jumps (JZ, JNZ, JMP, JNE) must target a label (e.g., 'JZ MY_LABEL').
-    /// - Labels are defined with a colon (e.g., 'MY_LABEL:').
-    /// - Pass 1: Builds a symbol table of labels and their byte offsets.
-    /// - Pass 2: Encodes instructions and calculates relative sbyte displacements for jumps.
+    /// - Features an intelligent 'PUSH' macro that accepts multiple arguments on one line
+    ///   (e.g., 'PUSH 1 0 0.5') and expands them into the most efficient sequence of
+    ///   PUSH_BYTE or PUSH_FLOAT instructions.
     /// </summary>
     public class HglAssemblerService
     {
@@ -23,8 +24,6 @@ namespace Hidra.API.Services
         }
 
         private readonly HglSpecificationDto _spec;
-        private readonly Dictionary<string, HglApiFunctionDto> _apiFunctions;
-        private readonly HashSet<string> _apiFunctionsWithReturnValue;
 
         public HglAssemblerService(HglService hglService)
         {
@@ -32,15 +31,6 @@ namespace Hidra.API.Services
 
             _spec = hglService.Specification
                     ?? throw new InvalidOperationException("HGL specification is not initialized.");
-            _apiFunctions = _spec.ApiFunctions.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
-
-            _apiFunctionsWithReturnValue = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                "API_AddSynapse", "API_CreateNeuron", "API_LoadLVar", "API_LoadGVar",
-                "API_GetSelfId", "API_GetPosition", "API_GetNeighborCount",
-                "API_GetNearestNeighborId", "API_GetNearestNeighborPosition",
-                "API_AddBrainNode", "API_Mitosis", "API_GetFiringRate"
-            };
         }
 
         public string Assemble(string sourceCode)
@@ -115,28 +105,40 @@ namespace Hidra.API.Services
                     continue;
                 }
 
-                var parts = cleanLine.Split(new[] { ' ', '\t', ',' }, StringSplitOptions.RemoveEmptyEntries);
+                var parts = cleanLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length > 0)
                 {
                     string mnemonic = parts[0].ToUpperInvariant();
                     
-                    if (mnemonic == "PUSH_CONST")
+                    if (mnemonic == "PUSH")
                     {
                         if (parts.Length < 2)
-                            throw new HglAssemblyException($"PUSH_CONST requires at least one integer operand (line {i + 1}).");
-                        
+                            throw new HglAssemblyException($"PUSH macro requires at least one numeric operand (line {i + 1}).");
+
+                        // Loop through all space-separated arguments on the line
                         for (int j = 1; j < parts.Length; j++)
                         {
-                            parsed.Add(new InstructionLine
+                            string valueStr = parts[j];
+
+                            if (int.TryParse(valueStr, out int intVal) && intVal >= 0 && intVal <= 255)
                             {
-                                Mnemonic = "PUSH_BYTE",
-                                Args = new List<string> { parts[j] },
-                                LineNumber = i + 1
-                            });
+                                parsed.Add(new InstructionLine { Mnemonic = "PUSH_BYTE", Args = new List<string> { valueStr }, LineNumber = i + 1 });
+                            }
+                            else if (float.TryParse(valueStr, NumberStyles.Any, CultureInfo.InvariantCulture, out _))
+                            {
+                                parsed.Add(new InstructionLine { Mnemonic = "PUSH_FLOAT", Args = new List<string> { valueStr }, LineNumber = i + 1 });
+                            }
+                            else
+                            {
+                                throw new HglAssemblyException($"Invalid operand '{valueStr}' for PUSH macro on line {i + 1}. Must be a valid number.");
+                            }
                         }
                     }
                     else
                     {
+                        if (mnemonic == "PUSH_CONST")
+                            throw new HglAssemblyException($"PUSH_CONST is obsolete. Use the 'PUSH <value>' macro instead (line {i + 1}).");
+
                         parsed.Add(new InstructionLine
                         {
                             Mnemonic = mnemonic,
@@ -181,7 +183,7 @@ namespace Hidra.API.Services
 
                 string mnemonic = MapMnemonic(instr.Mnemonic, instr.LineNumber);
                 if (!_spec.Instructions.TryGetValue(mnemonic, out byte opcode))
-                    throw new HglAssemblyException($"Internal error: Mnemonic '{mnemonic}' passed mapping but has no opcode (line {instr.LineNumber}).");
+                    throw new HglAssemblyException($"Internal error: Mnemonic '{mnemonic}' has no opcode (line {instr.LineNumber}).");
                 
                 bytes.Add(opcode);
 
@@ -190,6 +192,13 @@ namespace Hidra.API.Services
                     if (instr.Args.Count != 1 || !int.TryParse(instr.Args[0], out int val))
                         throw new HglAssemblyException($"PUSH_BYTE requires one integer operand (line {instr.LineNumber}).");
                     bytes.Add((byte)ClampByte(val));
+                }
+                else if (mnemonic == "PUSH_FLOAT")
+                {
+                    if (instr.Args.Count != 1 || !float.TryParse(instr.Args[0], NumberStyles.Any, CultureInfo.InvariantCulture, out float val))
+                        throw new HglAssemblyException($"PUSH_FLOAT requires one float operand (line {instr.LineNumber}).");
+                    
+                    bytes.AddRange(BitConverter.GetBytes(val));
                 }
                 else if (IsJumpMnemonic(mnemonic))
                 {
@@ -201,13 +210,15 @@ namespace Hidra.API.Services
                         throw new HglAssemblyException($"Undefined label '{label}' targeted on line {instr.LineNumber}.");
 
                     int currentByteOffset = byteOffsets[instr];
-                    int instructionSize = 2;
+                    int instructionSize = 3; // Jumps are 3 bytes (1 opcode + 2 operand)
                     long delta = (long)targetByteOffset - (currentByteOffset + instructionSize);
 
-                    if (delta < sbyte.MinValue || delta > sbyte.MaxValue)
-                        throw new HglAssemblyException($"Jump target '{label}' is too far on line {instr.LineNumber}. Jumps must be within +/-127 bytes.");
+                    if (delta < short.MinValue || delta > short.MaxValue)
+                        throw new HglAssemblyException($"Jump target '{label}' is too far on line {instr.LineNumber}. Jumps must be within +/-32767 bytes.");
 
-                    bytes.Add(unchecked((byte)(sbyte)delta));
+                    short displacement = (short)delta;
+                    bytes.Add((byte)(displacement & 0xFF));        // Low byte
+                    bytes.Add((byte)((displacement >> 8) & 0xFF)); // High byte
                 }
             }
             return bytes.ToArray();
@@ -225,16 +236,17 @@ namespace Hidra.API.Services
         {
             string mnemonic = MapMnemonic(instr.Mnemonic, instr.LineNumber);
             
-            if (IsJumpMnemonic(mnemonic) || mnemonic == "PUSH_BYTE")
-                return 2;
+            if (mnemonic == "PUSH_FLOAT") return 5;
+            if (mnemonic == "PUSH_BYTE") return 2;
+            if (IsJumpMnemonic(mnemonic)) return 3;
 
             return 1;
         }
 
         private string MapMnemonic(string rawUpper, int line)
         {
-            if (rawUpper == "PUSH_CONST") 
-                throw new HglAssemblyException($"Internal error: PUSH_CONST should be expanded before this stage (line {line}).");
+            if (rawUpper == "PUSH") 
+                throw new HglAssemblyException($"Internal error: PUSH macro should be expanded before this stage (line {line}).");
 
             if (_spec.Instructions.ContainsKey(rawUpper)) return rawUpper;
             var ciHit = _spec.Instructions.Keys.FirstOrDefault(k => k.Equals(rawUpper, StringComparison.OrdinalIgnoreCase));

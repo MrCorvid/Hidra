@@ -27,7 +27,6 @@ namespace Hidra.API.Controllers
 
         #region Continuous (Non-Audited) Lifecycle Control
 
-        // ... (start, pause, resume, stop, step, atomicStep, save methods are unchanged) ...
         [HttpPost("start")]
         public IActionResult Start(string expId)
         {
@@ -88,17 +87,19 @@ namespace Hidra.API.Controllers
             AtomicStepResponseDto response;
             lock(exp.GetLockObject())
             {
-                if (exp.State != SimulationState.Idle)
+                if (exp.State != SimulationState.Idle && exp.State != SimulationState.Paused)
                 {
-                    return Conflict(new { error = "Conflict", message = "Cannot perform atomic step while a continuous run is active. Stop it first."});
+                    return Conflict(new { error = "Conflict", message = "Cannot perform atomic step while a continuous run is active. Stop or pause it first."});
                 }
-                
+
+                ulong previousTick = exp.World.CurrentTick;
                 exp.World.ApplyInputsAndStep(body.Inputs);
                 
                 response = new AtomicStepResponseDto
                 {
                     NewTick = exp.World.CurrentTick,
-                    EventsProcessed = exp.World.GetEventsForTick(exp.World.CurrentTick),
+                    // --- FIX: Return the events for the tick that was just processed, not the new (empty) one ---
+                    EventsProcessed = exp.World.GetEventsForTick(previousTick),
                     OutputValues = exp.World.GetOutputValues(body.OutputIdsToRead)
                 };
             }
@@ -126,9 +127,6 @@ namespace Hidra.API.Controllers
 
         #region Audited Run Endpoints
 
-        /// <summary>
-        /// Creates and starts a new audited run for an experiment.
-        /// </summary>
         [HttpPost("runs")]
         [ProducesResponseType(StatusCodes.Status202Accepted)]
         [ProducesResponseType(StatusCodes.Status404NotFound)]
@@ -159,9 +157,6 @@ namespace Hidra.API.Controllers
             return AcceptedAtAction(nameof(GetRun), new { expId, runId = run.Id }, response);
         }
 
-        /// <summary>
-        /// Retrieves the status and results of a specific audited run.
-        /// </summary>
         [HttpGet("runs/{runId}")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status404NotFound)]

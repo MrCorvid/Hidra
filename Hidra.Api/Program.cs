@@ -22,6 +22,7 @@ builder.Services.AddControllers().AddNewtonsoftJson(options =>
 builder.Services.AddSingleton<ExperimentManager>();
 builder.Services.AddSingleton<HglService>();
 builder.Services.AddSingleton<HglAssemblerService>(); 
+builder.Services.AddSingleton<HglDecompilerService>(); // <-- This line was added to register the new service.
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();

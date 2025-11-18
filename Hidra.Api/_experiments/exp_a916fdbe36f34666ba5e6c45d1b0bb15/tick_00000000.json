@@ -1,0 +1,22 @@
+{
+  "ExperimentId": "114e688abd5c4df9b214458b6f4a7e23",
+  "CurrentTick": 0,
+  "InputNodes": [
+    {
+      "Id": 0,
+      "Value": 0.0
+    },
+    {
+      "Id": 1,
+      "Value": 0.0
+    }
+  ],
+  "OutputNodes": [
+    {
+      "Id": 10,
+      "Value": 0.0
+    }
+  ],
+  "Neurons": [],
+  "Synapses": []
+}

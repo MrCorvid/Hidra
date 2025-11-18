@@ -71,6 +71,12 @@ namespace Hidra.Core
             programRoot.addChild(funcList);
             mainStatementList.addChild(new AST(new Token(Token.TokenType.STATEMENT_LIST, "<GLOBAL_VARIABLE_DEFINITIONS_LIST>")));
             mainStatementList.addChild(geneAst);
+            
+            Action<string>? traceAction = null;
+            if (Logger.IsLogLevelEnabled("HGL_TRACE", LogLevel.Trace))
+            {
+                traceAction = (message) => Log("HGL_TRACE", LogLevel.Trace, $"[Gene:{geneId}] [Neuron:{self?.Id ?? 0}] {message}");
+            }
 
             // IMPORTANT: Bind function definitions to the *actual* per-execution bridge
             var bridge = new HidraSprakBridge(this, self, context);
@@ -106,7 +112,12 @@ namespace Hidra.Core
                 return;
             }
 
-            bridge.SetInterpreter(interpreter);
+            interpreter.OnTrace = traceAction;
+
+            // This is the line where the warning occurred.
+            // We add the null-forgiving operator '!' because we have already
+            // confirmed that 'interpreter' is not null in the block above.
+            bridge.SetInterpreter(interpreter!);
 
             // --- Execution with Fuel Constraint ---
             int instructionCount = 0;

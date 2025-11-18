@@ -8,13 +8,35 @@
     }
   },
   "log_tags": {
-    "SIM_CORE":     { "level": "Debug", "target": "full_capture" },
-    "EVENT_QUEUE":  { "level": "Debug", "target": "full_capture" },
-    "PARSER":       { "level": "Debug", "target": "full_capture" },
-    "NN_BRAIN":     { "level": "Debug", "target": "full_capture" },
-
-    "LOGGER":       { "level": "Info", "target": "console", "color": "Yellow" },
-    "API_ERROR":    { "level": "Error", "target": "console", "color": "Red" },
-    "default":      { "level": "Info", "target": "console" }
+    "SIM_CORE": {
+      "level": "Trace",
+      "target": "full_capture"
+    },
+    "EVENT_QUEUE": {
+      "level": "Trace",
+      "target": "full_capture"
+    },
+    "PARSER": {
+      "level": "Trace",
+      "target": "full_capture"
+    },
+    "NN_BRAIN": {
+      "level": "Trace",
+      "target": "full_capture"
+    },
+    "LOGGER": {
+      "level": "Info",
+      "target": "console",
+      "color": "Yellow"
+    },
+    "API_ERROR": {
+      "level": "Error",
+      "target": "console",
+      "color": "Red"
+    },
+    "default": {
+      "level": "Trace",
+      "target": "full_capture"
+    }
   }
 }

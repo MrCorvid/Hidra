@@ -11,7 +11,7 @@ public static class HGLOpcodes
 {
     #region Opcode Constants (Dynamically Initialized)
 
-    public static readonly byte NOP, PUSH_BYTE, DUP, POP;
+    public static readonly byte NOP, PUSH_BYTE, PUSH_FLOAT, DUP, POP;
     public static readonly byte StoreLVar, LoadLVar, GetSelfId, GetPosition;
     public static readonly byte StoreGVar, LoadGVar;
     public static readonly byte CreateNeuron, Apoptosis, Mitosis, CallGene, SetSystemTarget;
@@ -54,7 +54,7 @@ public static class HGLOpcodes
         MasterInstructionOrder = new List<string>
         {
             // -- Core Execution --
-            "API_NOP", "API_PUSH_BYTE", "API_DUP", "API_POP",
+            "API_NOP", "API_PUSH_BYTE", "API_PUSH_FLOAT", "API_DUP", "API_POP",
             
             // -- Core API --
             "API_StoreLVar", "API_LoadLVar", "API_GetSelfId", "API_GetPosition", "API_StoreGVar", "API_LoadGVar",
