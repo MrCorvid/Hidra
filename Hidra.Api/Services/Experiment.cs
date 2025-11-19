@@ -1,6 +1,5 @@
-// In Hidra.API/Services/Experiment.cs
+// Hidra.API/Services/Experiment.cs
 using Hidra.Core;
-// Note: Hidra.Core.Logging is still used, but we will be more specific below.
 using Hidra.API.DTOs;
 using System;
 using System.Threading;
@@ -19,40 +18,45 @@ namespace Hidra.API.Services
         public string Id { get; }
         public string Name { get; }
         public SimulationState State { get; private set; }
-        // FIX: Explicitly use the custom LogLevel enum to resolve ambiguity.
         public Hidra.Core.Logging.LogLevel MinimumLogLevel { get; private set; } = Hidra.Core.Logging.LogLevel.Info;
         public long Seed { get; }
-        public Hidra.Core.HidraWorld World { get; } // Fully qualifying HidraWorld is good practice but not the error source
+        public Hidra.Core.HidraWorld World { get; } 
         
         public List<Run> RunHistory { get; } = new List<Run>();
-        public List<Hidra.Core.Logging.LogEntry> LogHistory { get; } = new List<Hidra.Core.Logging.LogEntry>(8192);
-        
-        private readonly string _storagePath;
-        private readonly Action<string, Hidra.Core.Logging.LogLevel, string> _worldLogger;
+        public ExperimentDbService Db { get; }
 
+        private readonly Action<string, Hidra.Core.Logging.LogLevel, string> _worldLogger;
         private Task? _runLoopTask;
         private CancellationTokenSource _cts = new();
         private readonly object _worldLock = new();
+        private readonly List<Hidra.Core.Logging.LogEntry> _logBuffer = new(50);
+        private readonly object _logBufferLock = new();
 
         public Experiment(string id, string name, CreateExperimentRequestDto request, string storagePath)
         {
             Id = id;
             Name = name;
             State = SimulationState.Idle;
-            _storagePath = storagePath;
+            
+            Db = new ExperimentDbService(storagePath, id);
+            Db.SaveMetadata("Name", name);
+            Db.SaveMetadata("Config", JsonConvert.SerializeObject(request.Config));
 
             _worldLogger = (tag, level, message) =>
             {
                 if (level >= MinimumLogLevel)
                 {
-                    lock (LogHistory) { LogHistory.Add(new Hidra.Core.Logging.LogEntry(DateTime.Now, level, tag, message, this.Id)); }
+                    lock (_logBufferLock) 
+                    { 
+                        _logBuffer.Add(new Hidra.Core.Logging.LogEntry(DateTime.Now, level, tag, message, this.Id));
+                        if (_logBuffer.Count >= 1000) FlushLogs();
+                    }
                 }
             };
             
             World = new Hidra.Core.HidraWorld(request.Config, request.HGLGenome, request.IOConfig.InputNodeIds, request.IOConfig.OutputNodeIds, _worldLogger);
             Seed = (long)World.Config.Seed0;
 
-            Directory.CreateDirectory(_storagePath);
             SaveCurrentTickState();
         }
         
@@ -61,40 +65,62 @@ namespace Hidra.API.Services
             Id = id;
             Name = name;
             State = SimulationState.Idle;
+            Db = new ExperimentDbService(storagePath, id);
             World = restoredWorld;
             Seed = (long)World.Config.Seed0;
-            _storagePath = storagePath;
-
+            
             _worldLogger = (tag, level, message) =>
             {
                 if (level >= MinimumLogLevel)
                 {
-                    lock (LogHistory) { LogHistory.Add(new Hidra.Core.Logging.LogEntry(DateTime.Now, level, tag, message, this.Id)); }
+                     lock (_logBufferLock) 
+                    { 
+                        _logBuffer.Add(new Hidra.Core.Logging.LogEntry(DateTime.Now, level, tag, message, this.Id));
+                         if (_logBuffer.Count >= 1000) FlushLogs();
+                    }
                 }
             };
-            
             World.SetLogAction(_worldLogger);
-            Directory.CreateDirectory(_storagePath);
-            SaveCurrentTickState();
         }
         
-        // FIX: Explicitly use the custom LogLevel enum in the method signature.
         public void SetMinimumLogLevel(Hidra.Core.Logging.LogLevel level)
         {
             this.MinimumLogLevel = level;
             Log("EXPERIMENT", Hidra.Core.Logging.LogLevel.Info, $"Minimum log level for this experiment changed to {level}.");
         }
 
-        private void SaveCurrentTickState()
+        public void SaveCurrentTickState()
         {
-            var state = World.GetFullWorldState();
-            var filePath = Path.Combine(_storagePath, $"tick_{state.CurrentTick:D8}.json");
-            var json = JsonConvert.SerializeObject(state, new JsonSerializerSettings 
+            FlushLogs(); 
+            
+            // 1. Get the raw internal JSON string (required for restarts)
+            string internalJson = World.SaveStateToJson();
+            
+            // 2. Get events from the previous execution tick
+            ulong relevantTick = World.CurrentTick > 0 ? World.CurrentTick - 1 : 0;
+            var events = new List<Event>(World.GetEventsForTick(relevantTick));
+
+            // 3. Create wrapper
+            var persistedData = new PersistedTick 
+            { 
+                WorldStateJson = internalJson, 
+                Events = events 
+            };
+
+            // 4. Save
+            Db.SaveSnapshot(World.CurrentTick, persistedData);
+        }
+        
+        private void FlushLogs()
+        {
+            List<Hidra.Core.Logging.LogEntry> batch;
+            lock (_logBufferLock)
             {
-                Formatting = Formatting.Indented,
-                ReferenceLoopHandling = ReferenceLoopHandling.Ignore 
-            });
-            File.WriteAllText(filePath, json);
+                if (_logBuffer.Count == 0) return;
+                batch = new List<Hidra.Core.Logging.LogEntry>(_logBuffer);
+                _logBuffer.Clear();
+            }
+            Db.WriteLogBatch(World.CurrentTick, batch);
         }
 
         private void Log(string tag, Hidra.Core.Logging.LogLevel level, string message) => _worldLogger(tag, level, message);
@@ -104,20 +130,18 @@ namespace Hidra.API.Services
         public Run CreateAndExecuteRun(CreateRunRequestDto request)
         {
             var run = new Run(this, request);
-            RunHistory.Add(run);
-            run.Execute();
+            lock (_worldLock) { RunHistory.Add(run); }
+            Task.Run(() => run.Execute());
             return run;
         }
         
-        #region Continuous (Non-Audited) Lifecycle Control
-
         public void Start()
         {
             lock (_worldLock)
             {
                 if (State == SimulationState.Running) return;
+                if (_cts.IsCancellationRequested) _cts = new CancellationTokenSource();
                 State = SimulationState.Running;
-                _cts = new CancellationTokenSource();
                 _runLoopTask = Task.Run(() => ContinuousRunLoop(_cts.Token));
                 Log("EXPERIMENT", Hidra.Core.Logging.LogLevel.Info, "Continuous run loop started.");
             }
@@ -150,55 +174,58 @@ namespace Hidra.API.Services
         public void Stop()
         {
             Task? taskToAwait = null;
+            if (!_cts.IsCancellationRequested) _cts.Cancel();
+
             lock (_worldLock)
             {
                 if (State != SimulationState.Idle)
                 {
-                    if (!_cts.IsCancellationRequested) _cts.Cancel();
-                    State = SimulationState.Idle;
                     taskToAwait = _runLoopTask;
-                    Log("EXPERIMENT", Hidra.Core.Logging.LogLevel.Info, "Continuous run stopped.");
+                    State = SimulationState.Idle;
                 }
             }
-            try { taskToAwait?.Wait(TimeSpan.FromSeconds(1)); } catch { /* Ignore */ }
+
+            try { taskToAwait?.Wait(TimeSpan.FromSeconds(5)); } catch { }
+            Log("EXPERIMENT", Hidra.Core.Logging.LogLevel.Info, "Continuous run stopped.");
+            SaveCurrentTickState();
         }
 
         public void Step()
         {
             lock (_worldLock)
             {
-                if (State != SimulationState.Idle)
-                {
-                    Log("EXPERIMENT", Hidra.Core.Logging.LogLevel.Error, "Cannot 'Step' while a continuous simulation is running or paused. Stop it first.");
-                    return;
-                }
+                if (State != SimulationState.Idle) return;
                 World.Step();
-                SaveCurrentTickState();
             }
+            SaveCurrentTickState();
         }
 
         private void ContinuousRunLoop(CancellationToken token)
         {
             while (!token.IsCancellationRequested)
             {
+                bool performedStep = false;
                 if (State == SimulationState.Running)
                 {
                     lock (_worldLock)
                     {
-                        World.Step();
-                        SaveCurrentTickState();
+                        if (!token.IsCancellationRequested && State == SimulationState.Running)
+                        {
+                            World.Step();
+                            performedStep = true;
+                        }
                     }
+                    if (performedStep) SaveCurrentTickState();
                 }
-                try { Task.Delay(10, token).Wait(token); } catch (OperationCanceledException) { break; }
+                try { Task.Delay(performedStep ? 1 : 100, token).Wait(token); } catch { break; }
             }
             lock(_worldLock) { State = SimulationState.Idle; }
         }
         
-        #endregion
-
         public void Dispose()
         {
             Stop();
+            Db.Dispose();
             _cts.Dispose();
         }
     }

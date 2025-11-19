@@ -58,7 +58,6 @@ namespace Hidra.Core
             }
         }
 
-        // Add this new public method within the "Public Getters" region.
         /// <summary>
         /// Retrieves a list of all synapses that target the specified neuron.
         /// </summary>
@@ -68,14 +67,21 @@ namespace Hidra.Core
         {
             lock (_worldApiLock)
             {
-                // Ensure the cache is up-to-date before using it.
-                EnsureCachesUpToDate(); 
+
                 if (_incomingSynapseCache != null && _incomingSynapseCache.TryGetValue(targetNeuron.Id, out var synapses))
                 {
-                    // Return a sorted copy to ensure determinism and prevent external modification.
+                    // Fast Path: Return sorted copy from cache
                     return synapses.OrderBy(s => s.Id).ToList();
                 }
-                return new List<Synapse>();
+
+                // Slow Path / Fallback:
+                // If the cache is null (because the graph structure changed during this step),
+                // we calculate the result using LINQ. This is slower (O(N)) but safe,
+                // as it does not trigger a topological re-sort side effect.
+                return _synapses
+                    .Where(s => s.TargetId == targetNeuron.Id)
+                    .OrderBy(s => s.Id)
+                    .ToList();
             }
         }
 

@@ -124,7 +124,7 @@ namespace Hidra.Core
         public void API_ModifySynapse(float localIndex, float newWeight, float newParameter, float newSignalType)
         {
             LogTrace("BRIDGE.SYN", $"API_ModifySynapse(idx={localIndex}, w={newWeight}, p={newParameter}, sig={newSignalType})");
-            lock (_world)
+            lock (_world.SyncRoot)
             {
                 var synapse = GetSynapseByLocalIndex("API_ModifySynapse", localIndex);
                 if (synapse == null) return;
@@ -141,7 +141,7 @@ namespace Hidra.Core
         public void API_ClearSynapseCondition(float localIndex)
         {
             LogTrace("BRIDGE.SYN", $"API_ClearSynapseCondition(idx={localIndex})");
-            lock (_world)
+            lock (_world.SyncRoot)
             {
                 var synapse = GetSynapseByLocalIndex("API_ClearSynapseCondition", localIndex);
                 if (synapse != null) { synapse.Condition = null; }
@@ -173,7 +173,7 @@ namespace Hidra.Core
                 LogTrace("BRIDGE.SYN", $"Literal condition_type {intConditionType} invalid; fell back to {resolvedType}.");
             }
             
-            lock (_world)
+            lock (_world.SyncRoot)
             {
                 var synapse = GetSynapseByLocalIndex("API_SetSynapseCondition", localIndex);
                 if (synapse == null) return;

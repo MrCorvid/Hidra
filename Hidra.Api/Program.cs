@@ -5,6 +5,7 @@ using Hidra.API.Services;
 using Hidra.API.Middleware;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
+using Newtonsoft.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
 Logger.Init("logging_config.json");
@@ -14,15 +15,20 @@ builder.Services.AddControllers().AddNewtonsoftJson(options =>
 {
     // Use Newtonsoft.Json for serialization to support polymorphic types.
     // Setting TypeNameHandling to 'Auto' includes the '$type' property for interfaces
-    // and derived classes, which is required for correct deserialization of IBrain implementations.
+    // and derived classes.
     options.SerializerSettings.TypeNameHandling = TypeNameHandling.Auto;
     options.SerializerSettings.Converters.Add(new StringEnumConverter());
+    
+    // CRITICAL FIX: Enforce CamelCase (e.g., "CurrentTick" -> "currentTick").
+    // This ensures the Python client, which uses dictionary keys like frame['tick'],
+    // can correctly parse the response.
+    options.SerializerSettings.ContractResolver = new CamelCasePropertyNamesContractResolver();
 });
 
 builder.Services.AddSingleton<ExperimentManager>();
 builder.Services.AddSingleton<HglService>();
 builder.Services.AddSingleton<HglAssemblerService>(); 
-builder.Services.AddSingleton<HglDecompilerService>(); // <-- This line was added to register the new service.
+builder.Services.AddSingleton<HglDecompilerService>();
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -52,12 +58,10 @@ catch (Exception ex)
 }
 finally
 {
-    // Ensure the logger flushes all messages on shutdown in non-development environments.
     if (!app.Environment.IsDevelopment())
     {
         Logger.Shutdown();
     }
 }
 
-// This makes the Program class visible to the WebApplicationFactory in tests.
 public partial class Program { }

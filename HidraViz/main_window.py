@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QDockWidget, QTextEdit, QListWidget, QLabel, QLineEdit, QSplitter,
     QListWidgetItem, QMessageBox, QScrollArea, QFileDialog, QSlider, QComboBox,
-    QSpinBox, QTabWidget
+    QSpinBox, QTabWidget, QFrame
 )
 from PySide6.QtCore import Qt, QThread, Slot, QTimer
 from PySide6.QtGui import QAction, QFont, QActionGroup
@@ -17,6 +17,7 @@ from render_worker import RenderWorker, RenderPayload
 from renderer import Renderer3D
 from brain_renderer_2d import BrainRenderer2D
 from connection_dialog import ConnectionDialog
+from clone_dialog import CloneDialog
 from collapsible_box import CollapsibleBox
 
 class MainWindow(QMainWindow):
@@ -25,7 +26,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("HidraViz - PySide6 Edition")
         self.setGeometry(100, 100, 1600, 900)
 
-        # --- Application State ---
         self.selected_exp_id = None
         self.inspected_neuron_id: Optional[int] = None
         self.inspected_io_node: Optional[Tuple[str, int]] = None
@@ -38,9 +38,8 @@ class MainWindow(QMainWindow):
         self.staged_input_values = {}
         self.selected_input_id = None
         self.id_to_select_after_refresh = None
-        self._temp_initial_log_level = "Info" # Stores choice from dialog
+        self._temp_initial_log_level = "Info" 
 
-        # --- Worker Thread Setup ---
         self.command_queue = queue.Queue()
         self.worker_thread = QThread()
         self.worker = SimulationWorker(self.command_queue)
@@ -54,7 +53,6 @@ class MainWindow(QMainWindow):
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self._on_playback_tick)
 
-        # --- Connect worker signals to UI slots ---
         self.worker_thread.started.connect(self.worker.run)
         self.worker.signals.status_update.connect(self.log_message)
         self.worker.signals.logs_updated.connect(self.on_server_logs_received)
@@ -77,15 +75,11 @@ class MainWindow(QMainWindow):
         self.worker_thread.start()
         self.render_worker_thread.start()
 
-        # --- Create UI Widgets ---
         self.setup_ui()
-        
         self.renderer_3d.object_selected.connect(self.on_3d_object_selected)
-
         QTimer.singleShot(0, self.show_connection_dialog)
 
     def setup_ui(self):
-        # --- Menu Bar ---
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
         
@@ -96,10 +90,8 @@ class MainWindow(QMainWindow):
         self.save_replay_action = QAction("Save Replay As...", self)
         self.save_replay_action.triggered.connect(self.save_replay)
         file_menu.addAction(self.save_replay_action)
-
         file_menu.addSeparator()
 
-        # --- Logging Level Submenu ---
         self.logging_level_menu = file_menu.addMenu("&Logging Level")
         log_level_group = QActionGroup(self)
         log_level_group.setExclusive(True)
@@ -109,15 +101,13 @@ class MainWindow(QMainWindow):
             action = QAction(level, self, checkable=True)
             self.logging_level_menu.addAction(action)
             log_level_group.addAction(action)
-            if level == "Info":
-                action.setChecked(True)
+            if level == "Info": action.setChecked(True)
         
         log_level_group.triggered.connect(self.on_log_level_changed)
-        self.logging_level_menu.setEnabled(False) # Disabled by default
+        self.logging_level_menu.setEnabled(False)
 
         view_menu = menu_bar.addMenu("&View")
 
-        # --- Create Core Widgets ---
         self.renderer_3d = Renderer3D()
         self.log_widget = QTextEdit()
         self.log_widget.setReadOnly(True)
@@ -127,12 +117,9 @@ class MainWindow(QMainWindow):
         self.event_viewer_widget.setReadOnly(True)
         self.event_viewer_widget.setFont(QFont("Courier", 9))
 
-
-        # --- Create Controls Panel ---
         self.controls_panel = self._create_controls_panel()
         self.controls_panel.setEnabled(False)
 
-        # --- Layout Arrangement ---
         self.setDockNestingEnabled(True)
 
         self.dock_3d = QDockWidget("3D Visualizer", self)
@@ -140,7 +127,7 @@ class MainWindow(QMainWindow):
 
         self.dock_controls = QDockWidget("Controls", self)
         self.dock_controls.setWidget(self.controls_panel)
-        self.dock_controls.setMinimumWidth(380)
+        self.dock_controls.setMinimumWidth(400)
 
         self.dock_logs = QDockWidget("Logs", self)
         self.dock_logs.setWidget(self.log_widget)
@@ -191,79 +178,93 @@ class MainWindow(QMainWindow):
         scroll_area.setWidget(content_widget)
         content_layout = QVBoxLayout(content_widget)
 
-        # --- Experiment Management ---
-        exp_management_box = CollapsibleBox("Experiment Management", collapsed=False)
-        exp_list_layout = QVBoxLayout()
+        # --- Experiment Management Box ---
+        self.exp_mgmt_box = CollapsibleBox("Experiment Management", collapsed=False)
+        exp_mgmt_layout = QVBoxLayout()
+        self.exp_mgmt_tabs = QTabWidget()
+
+        # --- Tab 1: Active Experiments ---
+        self.active_exp_tab = QWidget()
+        active_layout = QVBoxLayout(self.active_exp_tab)
         self.exp_listbox = QListWidget()
         self.exp_listbox.currentItemChanged.connect(self.select_experiment)
-        exp_buttons_layout = QHBoxLayout()
-        self.refresh_button = QPushButton("Refresh List")
-        self.refresh_button.clicked.connect(self.refresh_experiment_list)
-        self.delete_exp_button = QPushButton("Delete Selected")
-        self.delete_exp_button.clicked.connect(self.delete_experiment)
-        exp_buttons_layout.addWidget(self.refresh_button)
-        exp_buttons_layout.addWidget(self.delete_exp_button)
-        exp_list_layout.addWidget(self.exp_listbox)
-        exp_list_layout.addLayout(exp_buttons_layout)
-        exp_management_box.setContentLayout(exp_list_layout)
-        content_layout.addWidget(exp_management_box)
-
-        # --- Create Experiment ---
-        self.create_exp_box = CollapsibleBox("Create New Experiment", collapsed=True)
-        create_exp_layout = QVBoxLayout()
-        create_exp_layout.addWidget(QLabel("Experiment Name:"))
-        self.new_exp_name_input = QLineEdit("my-new-experiment")
-        create_exp_layout.addWidget(self.new_exp_name_input)
-        create_exp_layout.addWidget(QLabel("HGL Genome:"))
-        self.new_exp_genome_input = QLineEdit("G")
-        create_exp_layout.addWidget(self.new_exp_genome_input)
-        create_exp_layout.addWidget(QLabel("Input Node IDs (e.g., 0, 1, 2):"))
-        self.new_exp_inputs_input = QLineEdit("0, 1")
-        create_exp_layout.addWidget(self.new_exp_inputs_input)
-        create_exp_layout.addWidget(QLabel("Output Node IDs (e.g., 10, 11):"))
-        self.new_exp_outputs_input = QLineEdit("10")
-        create_exp_layout.addWidget(self.new_exp_outputs_input)
-        self.create_exp_button = QPushButton("Create")
-        self.create_exp_button.clicked.connect(self.create_experiment)
-        create_exp_layout.addWidget(self.create_exp_button)
-        self.create_exp_box.setContentLayout(create_exp_layout)
-        content_layout.addWidget(self.create_exp_box)
+        active_layout.addWidget(self.exp_listbox)
         
-        # --- HGL Assembler / Decompiler ---
-        self.hgl_box = CollapsibleBox("HGL Assembler / Decompiler", collapsed=True)
-        hgl_main_layout = QVBoxLayout()
-        self.hgl_tabs = QTabWidget()
+        exp_buttons_layout = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_experiment_list)
+        self.delete_exp_button = QPushButton("Delete")
+        self.delete_exp_button.clicked.connect(self.delete_experiment)
+        self.clone_exp_button = QPushButton("Clone")
+        self.clone_exp_button.clicked.connect(self.clone_experiment)
+        
+        exp_buttons_layout.addWidget(self.refresh_button)
+        exp_buttons_layout.addWidget(self.clone_exp_button)
+        exp_buttons_layout.addWidget(self.delete_exp_button)
+        active_layout.addLayout(exp_buttons_layout)
+        self.exp_mgmt_tabs.addTab(self.active_exp_tab, "Active Experiments")
+
+        # --- Tab 2: Create New ---
+        self.create_exp_tab = QWidget()
+        create_layout = QVBoxLayout(self.create_exp_tab)
+        create_layout.addWidget(QLabel("Name:"))
+        self.new_exp_name_input = QLineEdit("my-new-experiment")
+        create_layout.addWidget(self.new_exp_name_input)
+        create_layout.addWidget(QLabel("HGL Genome:"))
+        self.new_exp_genome_input = QLineEdit("G")
+        create_layout.addWidget(self.new_exp_genome_input)
+        create_layout.addWidget(QLabel("Input IDs (e.g., 0, 1):"))
+        self.new_exp_inputs_input = QLineEdit("0, 1")
+        create_layout.addWidget(self.new_exp_inputs_input)
+        create_layout.addWidget(QLabel("Output IDs (e.g., 10):"))
+        self.new_exp_outputs_input = QLineEdit("10")
+        create_layout.addWidget(self.new_exp_outputs_input)
+        self.create_exp_button = QPushButton("Create Experiment")
+        self.create_exp_button.clicked.connect(self.create_experiment)
+        create_layout.addWidget(self.create_exp_button)
+        create_layout.addStretch()
+        self.exp_mgmt_tabs.addTab(self.create_exp_tab, "Create New")
+
+        # --- Tab 3: HGL Tools ---
+        self.hgl_tools_tab = QWidget()
+        hgl_tools_layout = QVBoxLayout(self.hgl_tools_tab)
+        self.hgl_sub_tabs = QTabWidget()
 
         self.assemble_tab = QWidget()
         assemble_layout = QVBoxLayout(self.assemble_tab)
-        assemble_layout.setContentsMargins(0,0,0,0)
         self.hgl_source_input = QTextEdit()
         self.hgl_source_input.setFont(QFont("Courier", 10))
-        self.hgl_source_input.setPlaceholderText("Enter HGL assembly code here...")
-        self.hgl_source_input.setPlainText("# Sample: Create a neuron\nPUSH_CONST 0 0 0\nCreateNeuron\nGN")
+        self.hgl_source_input.setPlaceholderText("HGL Assembly Source...")
+        self.hgl_source_input.setPlainText("# Sample\nPUSH_BYTE 0\nCreateNeuron\nGN")
         assemble_layout.addWidget(self.hgl_source_input)
-        self.assemble_button = QPushButton("Assemble to Bytecode ➜")
+        self.assemble_button = QPushButton("Assemble")
         self.assemble_button.clicked.connect(self.assemble_hgl)
         assemble_layout.addWidget(self.assemble_button)
-        self.hgl_tabs.addTab(self.assemble_tab, "Assemble")
+        self.hgl_sub_tabs.addTab(self.assemble_tab, "Assemble")
 
         self.decompile_tab = QWidget()
         decompile_layout = QVBoxLayout(self.decompile_tab)
-        decompile_layout.setContentsMargins(0,0,0,0)
         self.hgl_bytecode_input = QTextEdit()
         self.hgl_bytecode_input.setFont(QFont("Courier", 10))
-        self.hgl_bytecode_input.setPlaceholderText("Enter HGL hexadecimal bytecode here...")
+        self.hgl_bytecode_input.setPlaceholderText("Hex Bytecode...")
         decompile_layout.addWidget(self.hgl_bytecode_input)
-        self.decompile_button = QPushButton("➜ Decompile to Assembly")
+        self.decompile_button = QPushButton("Decompile")
         self.decompile_button.clicked.connect(self.decompile_hgl)
         decompile_layout.addWidget(self.decompile_button)
-        self.hgl_tabs.addTab(self.decompile_tab, "Decompile")
+        self.hgl_sub_tabs.addTab(self.decompile_tab, "Decompile")
 
-        hgl_main_layout.addWidget(self.hgl_tabs)
-        self.hgl_box.setContentLayout(hgl_main_layout)
-        content_layout.addWidget(self.hgl_box)
+        hgl_tools_layout.addWidget(self.hgl_sub_tabs)
+        self.exp_mgmt_tabs.addTab(self.hgl_tools_tab, "HGL Tools")
 
-        # --- I/O Control ---
+        exp_mgmt_layout.addWidget(self.exp_mgmt_tabs)
+        self.exp_mgmt_box.setContentLayout(exp_mgmt_layout)
+        content_layout.addWidget(self.exp_mgmt_box)
+
+        # --- NEW PARENT CONTAINER: Simulation Controls ---
+        self.controls_super_box = CollapsibleBox("Simulation Controls", collapsed=False)
+        controls_super_layout = QVBoxLayout()
+
+        # --- I/O Control Box (Child 1) ---
         self.io_box = CollapsibleBox("I/O Control", collapsed=False)
         io_layout = QVBoxLayout()
         io_layout.addWidget(QLabel("Input Staging:"))
@@ -297,9 +298,9 @@ class MainWindow(QMainWindow):
         self.output_display.setPlaceholderText("Output values will appear here...")
         io_layout.addWidget(self.output_display)
         self.io_box.setContentLayout(io_layout)
-        content_layout.addWidget(self.io_box)
+        controls_super_layout.addWidget(self.io_box) # Add to Super Layout
 
-        # --- Timeline & Playback Controls ---
+        # --- Playback Box (Child 2) ---
         self.playback_box = CollapsibleBox("Timeline & Playback", collapsed=False)
         playback_layout = QVBoxLayout()
         self.timeline_scrubber = QSlider(Qt.Orientation.Horizontal)
@@ -344,19 +345,19 @@ class MainWindow(QMainWindow):
         self.play_until_latest_button.clicked.connect(self.play_until_latest)
         adv_play_layout.addWidget(self.play_until_button)
         adv_play_layout.addWidget(self.play_until_latest_button)
-        playback_layout.addLayout(adv_play_layout)
         self.playback_box.setContentLayout(playback_layout)
-        content_layout.addWidget(self.playback_box)
         self.playback_box.setEnabled(False)
+        controls_super_layout.addWidget(self.playback_box) # Add to Super Layout
+
+        # --- Finalize Super Box ---
+        self.controls_super_box.setContentLayout(controls_super_layout)
+        content_layout.addWidget(self.controls_super_box)
 
         content_layout.addStretch()
         return scroll_container
 
-    # --- SLOTS (Callbacks & UI Updates) ---
     @Slot(str, str)
     def log_message(self, message, level):
-        # This function is now only for CLIENT-SIDE status messages.
-        # It appends to the log, which is fine for its purpose.
         self.log_widget.append(f"[{level.upper()}] {message}")
 
     @Slot()
@@ -370,10 +371,9 @@ class MainWindow(QMainWindow):
                 self.renderer_3d.clear_scene()
                 self.exp_listbox.clear()
                 self.controls_panel.setEnabled(False)
-                self.log_widget.clear() # Clear logs on new connection
+                self.log_widget.clear() 
                 self.log_message(f"Connecting...", "info")
                 self.command_queue.put(details)
-                # Store the chosen level to sync the UI menu upon successful connection
                 if details.get("type") == "CONNECT":
                     self._temp_initial_log_level = details.get("log_level", "Info")
 
@@ -384,13 +384,12 @@ class MainWindow(QMainWindow):
             self.is_offline_mode = False
             self.controls_panel.setEnabled(True)
             self.refresh_button.setEnabled(True)
-            self.create_exp_box.setEnabled(True)
+            # create_exp_box logic moved to tabs, handled by global panel enabled state
             self.delete_exp_button.setEnabled(True)
-            self.hgl_box.setEnabled(True)
+            self.clone_exp_button.setEnabled(False) # Disabled until selection
             self.logging_level_menu.setEnabled(True)
             self.log_message(f"Successfully connected to {url}", "success")
 
-            # Sync the main menu with the log level chosen in the connection dialog
             for action in self.logging_level_menu.actions():
                 if action.text().lower() == self._temp_initial_log_level.lower():
                     action.setChecked(True)
@@ -407,9 +406,8 @@ class MainWindow(QMainWindow):
         self.is_offline_mode = True
         self.controls_panel.setEnabled(True)
         self.refresh_button.setEnabled(False)
-        self.create_exp_box.setEnabled(False)
         self.delete_exp_button.setEnabled(False)
-        self.hgl_box.setEnabled(False)
+        self.clone_exp_button.setEnabled(False)
         self.logging_level_menu.setEnabled(False)
         self.log_widget.clear()
         self.log_message(f"Successfully loaded replay '{exp_name}'", "success")
@@ -430,7 +428,7 @@ class MainWindow(QMainWindow):
             self.log_message(f"Assembly successful. Bytecode generated.", "success")
             self.hgl_bytecode_input.setText(bytecode)
             self.new_exp_genome_input.setText(bytecode)
-            self.hgl_tabs.setCurrentWidget(self.decompile_tab)
+            self.hgl_sub_tabs.setCurrentWidget(self.decompile_tab)
         else:
             error_message = result_string
             self.log_message(f"Assembly failed: {error_message}", "error")
@@ -442,7 +440,7 @@ class MainWindow(QMainWindow):
             source_code = result_string
             self.log_message("Decompilation successful.", "success")
             self.hgl_source_input.setPlainText(source_code)
-            self.hgl_tabs.setCurrentWidget(self.assemble_tab)
+            self.hgl_sub_tabs.setCurrentWidget(self.assemble_tab)
         else:
             error_message = result_string
             self.log_message(f"Decompilation failed: {error_message}", "error")
@@ -450,10 +448,6 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def on_server_logs_received(self, server_logs: list):
-        """
-        Callback to update the log widget with logs fetched from the server.
-        This REPLACES the content of the log view.
-        """
         self.log_widget.clear()
         if not server_logs:
             self.log_widget.setText("No log entries received from server.")
@@ -465,9 +459,7 @@ class MainWindow(QMainWindow):
             level = entry.get('level', 'INFO').upper()
             tag = entry.get('tag', 'DEFAULT')
             message = entry.get('message', '')
-            
             time_part = timestamp.split('T')[1].split('.')[0] if 'T' in timestamp else timestamp
-
             log_lines.append(f"{time_part} [{level:<7}] [{tag}] {message}")
         
         self.log_widget.setText("\n".join(log_lines))
@@ -493,7 +485,6 @@ class MainWindow(QMainWindow):
     def on_experiment_list_received(self, experiments):
         current_item = self.exp_listbox.currentItem()
         current_id = current_item.data(Qt.ItemDataRole.UserRole) if current_item else None
-        
         id_to_select = self.id_to_select_after_refresh if self.id_to_select_after_refresh else current_id
 
         self.exp_listbox.clear()
@@ -511,15 +502,19 @@ class MainWindow(QMainWindow):
             self.selected_exp_id = None
             self.save_replay_action.setEnabled(False)
             self.playback_box.setEnabled(False)
+            self.delete_exp_button.setEnabled(False)
+            self.clone_exp_button.setEnabled(False)
 
         self.log_message(f"Refreshed experiment list. Found {len(experiments)}.", "info")
         self.id_to_select_after_refresh = None
 
     @Slot(dict)
     def on_experiment_created(self, new_exp):
-        self.log_message(f"Successfully created experiment '{new_exp['name']}' ({new_exp['id']})", "success")
+        self.log_message(f"Successfully created/cloned experiment '{new_exp['name']}' ({new_exp['id']})", "success")
         self.id_to_select_after_refresh = new_exp['id']
         self.refresh_experiment_list()
+        # Switch back to the active experiments tab to see the new one
+        self.exp_mgmt_tabs.setCurrentWidget(self.active_exp_tab)
 
     @Slot(str)
     def on_experiment_deleted(self, deleted_exp_id):
@@ -529,14 +524,13 @@ class MainWindow(QMainWindow):
             self.save_replay_action.setEnabled(False)
             self.renderer_3d.clear_scene()
             self.setWindowTitle("HidraViz - PySide6 Edition")
+            self.delete_exp_button.setEnabled(False)
+            self.clone_exp_button.setEnabled(False)
         self.refresh_experiment_list()
     
     @Slot(QAction)
     def on_log_level_changed(self, action: QAction):
-        """Slot to handle a log level change from the main menu."""
-        if not self.selected_exp_id or self.is_offline_mode:
-            return
-        
+        if not self.selected_exp_id or self.is_offline_mode: return
         new_level = action.text()
         self.log_message(f"Requesting log level change to '{new_level}' for {self.selected_exp_id}", "info")
         self.command_queue.put({
@@ -595,6 +589,7 @@ class MainWindow(QMainWindow):
         if not current_item:
             self.selected_exp_id = None
             self.delete_exp_button.setEnabled(False)
+            self.clone_exp_button.setEnabled(False)
             self.save_replay_action.setEnabled(False)
             self.playback_box.setEnabled(False)
             self.logging_level_menu.setEnabled(False)
@@ -617,12 +612,12 @@ class MainWindow(QMainWindow):
 
         self.playback_box.setEnabled(True)
         self.delete_exp_button.setEnabled(True)
+        self.clone_exp_button.setEnabled(True)
         self.save_replay_action.setEnabled(True)
         self.logging_level_menu.setEnabled(not self.is_offline_mode)
 
         if self.is_playing: self.play_pause_button.setChecked(False)
 
-        # Get the currently desired log level from the UI menu
         desired_log_level = "Info"
         if not self.is_offline_mode:
             for action in self.logging_level_menu.actions():
@@ -636,7 +631,7 @@ class MainWindow(QMainWindow):
             self.command_queue.put({
                 "type": "SELECT_EXPERIMENT", 
                 "exp_id": exp_id,
-                "log_level": desired_log_level # Pass the current setting
+                "log_level": desired_log_level
             })
 
     @Slot(str)
@@ -655,7 +650,6 @@ class MainWindow(QMainWindow):
             if frame: self._display_frame(frame)
             else: self.log_message(f"No history found for experiment {exp_id}.", "warning")
 
-    # --- Playback Logic ---
     @Slot(bool)
     def on_play_pause_toggled(self, is_checked):
         self.is_playing = is_checked
@@ -716,29 +710,23 @@ class MainWindow(QMainWindow):
         self.log_message("Querying server for latest tick...", "info")
         self.command_queue.put({"type": "GET_LIVE_STATUS", "exp_id": self.selected_exp_id})
 
-    # --- UI Action Slots ---
     def _parse_node_ids(self, text: str) -> list[int]:
-        if not text:
-            return []
+        if not text: return []
         items = text.replace(",", " ").split()
         ids = set()
         for item in items:
             if item.isdigit():
                 val = int(item)
-                if 0 <= val <= 255:
-                    ids.add(val)
-                else:
-                    self.log_message(f"Node ID {val} is outside the valid 0-255 range and was ignored.", "warning")
+                if 0 <= val <= 255: ids.add(val)
+                else: self.log_message(f"Node ID {val} is outside the valid 0-255 range and was ignored.", "warning")
         return sorted(list(ids))
 
     @Slot()
     def create_experiment(self):
         name = self.new_exp_name_input.text().strip()
         genome = self.new_exp_genome_input.text().strip()
-        
         input_ids = self._parse_node_ids(self.new_exp_inputs_input.text())
         output_ids = self._parse_node_ids(self.new_exp_outputs_input.text())
-        
         io_config = { "inputNodeIds": input_ids, "outputNodeIds": output_ids }
 
         if not name or not genome:
@@ -760,6 +748,24 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self.log_message(f"Requesting deletion of {exp_id}...", "info")
             self.command_queue.put({"type": "DELETE_EXPERIMENT", "exp_id": exp_id})
+
+    @Slot()
+    def clone_experiment(self):
+        if not self.selected_exp_id:
+            self.log_message("No experiment selected to clone.", "warning")
+            return
+
+        # Defaults: Tick = Current visualizer tick
+        dialog = CloneDialog(self.current_display_tick, self)
+        if dialog.exec():
+            name, tick = dialog.get_data()
+            self.log_message(f"Requesting clone of {self.selected_exp_id} at tick {tick}...", "info")
+            self.command_queue.put({
+                "type": "CLONE_EXPERIMENT",
+                "source_id": self.selected_exp_id,
+                "name": name,
+                "tick": tick
+            })
 
     @Slot()
     def save_replay(self):
@@ -833,10 +839,7 @@ class MainWindow(QMainWindow):
         if not frame: return
         self.current_display_tick = frame.tick
         
-        if self.current_display_tick == 0:
-            display_title = "Initial State (Ready for Tick 0)"
-        else:
-            display_title = f"State After Tick: {self.current_display_tick - 1}"
+        display_title = "Initial State" if self.current_display_tick == 0 else f"State After Tick: {self.current_display_tick - 1}"
         self.setWindowTitle(f"HidraViz - {display_title}")
 
         self.timeline_scrubber.blockSignals(True); self.timeline_scrubber.setValue(frame.tick); self.timeline_scrubber.blockSignals(False)
@@ -899,7 +902,8 @@ class MainWindow(QMainWindow):
                 if item.widget(): item.widget().deleteLater()
             self.staged_input_values = {nid: 0.0 for nid in input_ids}
             if self.selected_input_id not in self.staged_input_values:
-                self.selected_input_id, self.selected_input_label.setText("Selected: None")
+                self.selected_input_id = None
+                self.selected_input_label.setText("Selected: None")
             for node_id in sorted(input_ids):
                 bubble = QPushButton(str(node_id))
                 bubble.setProperty("node_id", node_id)
@@ -965,11 +969,8 @@ class MainWindow(QMainWindow):
         print("INFO: Close event received. Shutting down worker threads.")
         self.command_queue.put({"type": "STOP"})
         self.render_command_queue.put({"type": "STOP"})
-        
         self.worker_thread.quit()
         self.render_worker_thread.quit()
-        
         self.worker_thread.wait()
         self.render_worker_thread.wait()
-        
         event.accept()

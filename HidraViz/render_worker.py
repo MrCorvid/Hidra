@@ -24,16 +24,13 @@ class RenderPayload:
     normal_arrows: pv.PolyData | None = None
     firing_synapses: pv.PolyData | None = None
     firing_arrows: pv.PolyData | None = None
-    selection_highlight: pv.PolyData | None = None # <-- NEW FIELD
+    selection_highlight: pv.PolyData | None = None
 
 class RenderWorkerSignals(QObject):
     render_ready = Signal(object)
     status_update = Signal(str, str)
 
 class RenderWorker(QObject):
-    """
-    Performs the heavy lifting of creating 3D geometry in a background thread.
-    """
     def __init__(self, command_q: queue.Queue):
         super().__init__()
         self.command_q = command_q
@@ -53,11 +50,7 @@ class RenderWorker(QObject):
                     continue
 
                 if cmd_type == "PROCESS_FRAME":
-                    # --- START: MODIFICATION ---
-                    # Unpack the new selected_obj from the command
                     selected_obj: Optional[Tuple[str, int]] = command.get("selected_obj")
-                    # --- END: MODIFICATION ---
-                    
                     frame: ReplayFrame = command["frame"]
                     node_positions: Dict[Any, np.ndarray] = command["positions"]
                     input_ids: set = command["input_ids"]
@@ -83,26 +76,14 @@ class RenderWorker(QObject):
         valid_points, valid_ids = zip(*valid_points_with_ids)
         mesh = pv.PolyData(np.array(valid_points))
         
-        # Encode type into the ID using different ranges:
-        # input nodes: original_id (0-999)
-        # neurons: original_id + 10000 (10000-10999, etc.)
-        # output nodes: original_id + 20000 (20000-20999, etc.)
         encoded_ids = []
         for original_id in valid_ids:
-            if node_type == 'input':
-                encoded_ids.append(original_id)
-            elif node_type == 'neuron':
-                encoded_ids.append(original_id + 10000)
-            elif node_type == 'output':
-                encoded_ids.append(original_id + 20000)
-            else:
-                encoded_ids.append(original_id)  # fallback
+            if node_type == 'input': encoded_ids.append(original_id)
+            elif node_type == 'neuron': encoded_ids.append(original_id + 10000)
+            elif node_type == 'output': encoded_ids.append(original_id + 20000)
+            else: encoded_ids.append(original_id)
         
         mesh.point_data['object_ids'] = np.array(encoded_ids)
-        
-        # Keep the types array for debugging, but don't rely on it
-        mesh.point_data['object_types'] = np.full(len(valid_ids), node_type, dtype='<U10')
-        
         return mesh
 
     def process_frame(self, frame, node_positions, input_ids_cache, output_ids_cache, selected_obj) -> RenderPayload:
@@ -135,16 +116,11 @@ class RenderWorker(QObject):
         payload.input_nodes = self._create_pickable_mesh(list(input_ids_cache), node_positions, 'input', 'input')
         payload.output_nodes = self._create_pickable_mesh(list(output_ids_cache), node_positions, 'output', 'output')
 
-        # --- START: NEW FEATURE LOGIC ---
-        # Create the highlight mesh if an object is selected
         if selected_obj:
             obj_type, obj_id = selected_obj
             pos_key = (obj_type, obj_id)
-            
             if pos_key in node_positions:
-                point_pos = node_positions[pos_key]
-                payload.selection_highlight = pv.PolyData([point_pos])
-        # --- END: NEW FEATURE LOGIC ---
+                payload.selection_highlight = pv.PolyData([node_positions[pos_key]])
                 
         active_io_keys = {('input', nid) for nid in active_input_ids} | {('output', nid) for nid in active_output_ids}
         if active_io_keys:

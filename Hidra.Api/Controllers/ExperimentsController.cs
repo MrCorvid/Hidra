@@ -1,11 +1,11 @@
-// In Hidra.API/Controllers/ExperimentsController.cs
+// Hidra.API/Controllers/ExperimentsController.cs
 using Hidra.API.DTOs;
 using Hidra.API.Services;
 using Microsoft.AspNetCore.Mvc;
 using System.Linq;
 using System;
 using Hidra.Core;
-using System.Numerics; // Required for Vector3.Zero
+using System.Collections.Generic;
 
 namespace Hidra.API.Controllers
 {
@@ -20,26 +20,38 @@ namespace Hidra.API.Controllers
             _manager = manager;
         }
 
+        /// <summary>
+        /// Creates a new experiment from scratch using an HGL genome.
+        /// </summary>
         [HttpPost]
         [ProducesResponseType(StatusCodes.Status201Created)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         public IActionResult CreateExperiment([FromBody] CreateExperimentRequestDto body)
         {
-            var experiment = _manager.CreateExperiment(body);
-
-            var response = new
+            try
             {
-                id = experiment.Id,
-                name = experiment.Name,
-                state = experiment.State.ToString().ToLowerInvariant(),
-                tick = experiment.World.CurrentTick,
-                createdAt = DateTime.UtcNow
-            };
+                var experiment = _manager.CreateExperiment(body);
 
-            return CreatedAtAction(nameof(GetExperiment), new { expId = experiment.Id }, response);
+                var response = new
+                {
+                    id = experiment.Id,
+                    name = experiment.Name,
+                    state = experiment.State.ToString().ToLowerInvariant(),
+                    tick = experiment.World.CurrentTick,
+                    createdAt = DateTime.UtcNow
+                };
+
+                return CreatedAtAction(nameof(GetExperiment), new { expId = experiment.Id }, response);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { error = "CreationFailed", message = ex.Message });
+            }
         }
-        
 
+        /// <summary>
+        /// Restores an experiment from a JSON snapshot.
+        /// </summary>
         [HttpPost("restore")]
         [ProducesResponseType(StatusCodes.Status201Created)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
@@ -48,8 +60,7 @@ namespace Hidra.API.Controllers
             HidraWorld restoredWorld;
             try
             {
-                // CORRECT: Call the new overload, passing primitives from the DTO.
-                // This properly decouples the Core from the API DTOs.
+                // Decouple DTO from Core logic by passing primitives
                 restoredWorld = HidraWorld.LoadStateFromJson(
                     body.SnapshotJson, 
                     body.HGLGenome, 
@@ -63,7 +74,7 @@ namespace Hidra.API.Controllers
                 return BadRequest(new { error = "RestoreFailed", message = $"Failed to load world state from JSON: {ex.Message}"}); 
             }
             
-            // This part remains the same, as CreateExperimentRequestDto is a valid DTO for the manager.
+            // Create a compatible creation request for the manager wrapper
             var createRequest = new CreateExperimentRequestDto
             {
                 Name = body.Name,
@@ -84,6 +95,55 @@ namespace Hidra.API.Controllers
             };
             
             return CreatedAtAction(nameof(GetExperiment), new { expId = experiment.Id }, response);
+        }
+
+        /// <summary>
+        /// Clones an existing experiment starting from a specific tick.
+        /// The new experiment will contain history up to the specified tick and 
+        /// will start simulation exactly from that point.
+        /// </summary>
+        /// <param name="expId">The ID of the source experiment to clone.</param>
+        /// <param name="body">DTO containing the new name and the target tick.</param>
+        /// <returns>The details of the newly created experiment.</returns>
+        [HttpPost("{expId}/clone")]
+        [ProducesResponseType(StatusCodes.Status201Created)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        public IActionResult CloneExperiment(string expId, [FromBody] CloneExperimentRequestDto body)
+        {
+            try
+            {
+                var newExperiment = _manager.CloneExperiment(expId, body);
+
+                var response = new
+                {
+                    id = newExperiment.Id,
+                    name = newExperiment.Name,
+                    state = newExperiment.State.ToString().ToLowerInvariant(),
+                    tick = newExperiment.World.CurrentTick,
+                    createdAt = DateTime.UtcNow
+                };
+
+                return CreatedAtAction(nameof(GetExperiment), new { expId = newExperiment.Id }, response);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return NotFound(new { error = "NotFound", message = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Usually occurs if source is running/not idle
+                return Conflict(new { error = "Conflict", message = ex.Message });
+            }
+            catch (ArgumentOutOfRangeException ex)
+            {
+                return BadRequest(new { error = "BadRequest", message = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = "InternalServerError", message = $"Cloning failed: {ex.Message}" });
+            }
         }
 
         /// <summary>

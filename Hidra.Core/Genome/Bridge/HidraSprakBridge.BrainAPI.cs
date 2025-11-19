@@ -500,27 +500,261 @@ namespace Hidra.Core
 
         #endregion
 
-        #region Brain API - Placeholders
-        
-        [SprakAPI("Constructs a sparsely connected feed-forward network.", "input_count", "hidden_count", "output_count", "connection_density")]
-        public void API_CreateBrain_SparseFeedForward(float a, float b, float c, float d)
+        #region Brain API - Advanced Constructors
+
+        /// <summary>
+        /// Helper to prepare a target neuron for brain replacement.
+        /// Returns the internal network and the RNG, or null/null if invalid.
+        /// </summary>
+        private (NeuralNetwork? net, IPrng? rng) PrepareBrainForReset()
         {
-            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_SparseFeedForward(a={a}, b={b}, c={c}, d={d})");
-            LogWarn("BRIDGE.BRAIN", "'API_CreateBrain_SparseFeedForward' is not yet implemented.");
+            var target = GetTargetNeuron();
+            if (target == null) return (null, null);
+
+            // Ensure the brain is a NeuralNetwork
+            if (target.Brain is not NeuralNetworkBrain)
+            {
+                var newBrain = new NeuralNetworkBrain();
+                newBrain.SetPrng(_world.InternalRng);
+                target.Brain = newBrain;
+            }
+
+            var nnBrain = (NeuralNetworkBrain)target.Brain;
+            var network = nnBrain.GetInternalNetwork();
+            network.Clear(); // Wipe the slate clean
+
+            return (network, _world.InternalRng);
         }
 
-        [SprakAPI("Constructs an autoencoder network.", "visible_count", "hidden_count")]
-        public void API_CreateBrain_Autoencoder(float a, float b)
+        [SprakAPI("Constructs a sparsely connected feed-forward network. Density is 0.0 to 1.0.", 
+                  "input_count", "hidden_count", "output_count", "density")]
+        public void API_CreateBrain_SparseFeedForward(float inputCountF, float hiddenCountF, float outputCountF, float density)
         {
-            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_Autoencoder(a={a}, b={b})");
-            LogWarn("BRIDGE.BRAIN", "'API_CreateBrain_Autoencoder' is not yet implemented.");
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_SparseFeedForward(in={inputCountF}, hid={hiddenCountF}, out={outputCountF}, dens={density})");
+            
+            lock (_world.SyncRoot)
+            {
+                var (network, rng) = PrepareBrainForReset();
+                if (network == null || rng == null) return;
+
+                int inputs = Math.Max(0, (int)inputCountF);
+                int hidden = Math.Max(0, (int)hiddenCountF);
+                int outputs = Math.Max(0, (int)outputCountF);
+                float denseProb = Math.Clamp(density, 0.01f, 1.0f);
+
+                int nextId = 0;
+                var inputIds = new List<int>();
+                var hiddenIds = new List<int>();
+                var outputIds = new List<int>();
+
+                // 1. Create Nodes
+                for (int i = 0; i < inputs; i++) 
+                { 
+                    int id = nextId++; 
+                    inputIds.Add(id); 
+                    network.AddNode(new NNNode(id, NNNodeType.Input)); 
+                }
+                for (int i = 0; i < hidden; i++) 
+                { 
+                    int id = nextId++; 
+                    hiddenIds.Add(id); 
+                    // Random bias [-1, 1]
+                    network.AddNode(new NNNode(id, NNNodeType.Hidden) { Bias = (rng.NextFloat() * 2f) - 1f }); 
+                }
+                for (int i = 0; i < outputs; i++) 
+                { 
+                    int id = nextId++; 
+                    outputIds.Add(id); 
+                    network.AddNode(new NNNode(id, NNNodeType.Output) { Bias = (rng.NextFloat() * 2f) - 1f }); 
+                }
+
+                // 2. Create Connections (Input -> Hidden)
+                if (hidden > 0)
+                {
+                    foreach (var src in inputIds)
+                    {
+                        foreach (var dst in hiddenIds)
+                        {
+                            if (rng.NextFloat() < denseProb)
+                            {
+                                network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                            }
+                        }
+                    }
+                    // 3. Create Connections (Hidden -> Output)
+                    foreach (var src in hiddenIds)
+                    {
+                        foreach (var dst in outputIds)
+                        {
+                            if (rng.NextFloat() < denseProb)
+                            {
+                                network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Direct Input -> Output if no hidden layer
+                    foreach (var src in inputIds)
+                    {
+                        foreach (var dst in outputIds)
+                        {
+                            if (rng.NextFloat() < denseProb)
+                            {
+                                network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                            }
+                        }
+                    }
+                }
+            }
         }
-        
-        [SprakAPI("Constructs a feed-forward network with randomized topology.", "input_count", "hidden_count", "output_count", "randomness_factor")]
-        public void API_CreateBrain_RandomizedFeedForward(float a, float b, float c, float d)
+
+        [SprakAPI("Constructs an Autoencoder style network (Input -> Hidden -> Output). Output count matches Visible count.", 
+                  "visible_count", "hidden_count")]
+        public void API_CreateBrain_Autoencoder(float visibleCountF, float hiddenCountF)
         {
-            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_RandomizedFeedForward(a={a}, b={b}, c={c}, d={d})");
-            LogWarn("BRIDGE.BRAIN", "'API_CreateBrain_RandomizedFeedForward' is not yet implemented.");
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_Autoencoder(vis={visibleCountF}, hid={hiddenCountF})");
+
+            lock (_world.SyncRoot)
+            {
+                var (network, rng) = PrepareBrainForReset();
+                if (network == null || rng == null) return;
+
+                int visible = Math.Max(1, (int)visibleCountF);
+                int hidden = Math.Max(1, (int)hiddenCountF);
+
+                int nextId = 0;
+                var inputIds = new List<int>();
+                var hiddenIds = new List<int>();
+                var outputIds = new List<int>();
+
+                // 1. Create Topology
+                for (int i = 0; i < visible; i++)
+                {
+                    int id = nextId++;
+                    inputIds.Add(id);
+                    network.AddNode(new NNNode(id, NNNodeType.Input));
+                }
+                for (int i = 0; i < hidden; i++)
+                {
+                    int id = nextId++;
+                    hiddenIds.Add(id);
+                    network.AddNode(new NNNode(id, NNNodeType.Hidden) { Bias = (rng.NextFloat() * 2f) - 1f });
+                }
+                for (int i = 0; i < visible; i++) // Output count == Visible count
+                {
+                    int id = nextId++;
+                    outputIds.Add(id);
+                    network.AddNode(new NNNode(id, NNNodeType.Output) { Bias = (rng.NextFloat() * 2f) - 1f });
+                }
+
+                // 2. Fully Connect (Input -> Hidden)
+                foreach (var src in inputIds)
+                {
+                    foreach (var dst in hiddenIds)
+                    {
+                        network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                    }
+                }
+
+                // 3. Fully Connect (Hidden -> Output)
+                foreach (var src in hiddenIds)
+                {
+                    foreach (var dst in outputIds)
+                    {
+                        network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                    }
+                }
+            }
+        }
+
+        [SprakAPI("Constructs a Feed-Forward network with randomized internal topology (no cycles).", 
+                  "input_count", "hidden_count", "output_count", "randomness_factor")]
+        public void API_CreateBrain_RandomizedFeedForward(float inputCountF, float hiddenCountF, float outputCountF, float randomness)
+        {
+            LogTrace("BRIDGE.BRAIN", $"API_CreateBrain_RandomizedFeedForward(in={inputCountF}, hid={hiddenCountF}, out={outputCountF}, rnd={randomness})");
+
+            lock (_world.SyncRoot)
+            {
+                var (network, rng) = PrepareBrainForReset();
+                if (network == null || rng == null) return;
+
+                int inputs = Math.Max(0, (int)inputCountF);
+                int hidden = Math.Max(0, (int)hiddenCountF);
+                int outputs = Math.Max(0, (int)outputCountF);
+                float prob = Math.Clamp(randomness, 0.05f, 1.0f);
+
+                int nextId = 0;
+                var inputIds = new List<int>();
+                var hiddenIds = new List<int>();
+                var outputIds = new List<int>();
+
+                // 1. Create Nodes
+                for (int i = 0; i < inputs; i++)
+                {
+                    int id = nextId++;
+                    inputIds.Add(id);
+                    network.AddNode(new NNNode(id, NNNodeType.Input));
+                }
+                
+                // Note: We store hidden nodes in a list. We will only allow connections from index i -> j where i < j.
+                // This strict ordering guarantees NO cycles, satisfying the NeuralNetwork safety check efficiently.
+                for (int i = 0; i < hidden; i++)
+                {
+                    int id = nextId++;
+                    hiddenIds.Add(id);
+                    network.AddNode(new NNNode(id, NNNodeType.Hidden) { Bias = (rng.NextFloat() * 2f) - 1f });
+                }
+
+                for (int i = 0; i < outputs; i++)
+                {
+                    int id = nextId++;
+                    outputIds.Add(id);
+                    network.AddNode(new NNNode(id, NNNodeType.Output) { Bias = (rng.NextFloat() * 2f) - 1f });
+                }
+
+                // 2. Inputs -> Any Hidden (Random)
+                foreach (var src in inputIds)
+                {
+                    foreach (var dst in hiddenIds)
+                    {
+                        if (rng.NextFloat() < prob)
+                            network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                    }
+                }
+
+                // 3. Hidden -> Downstream Hidden (Random, Forward-Only)
+                for (int i = 0; i < hiddenIds.Count; i++)
+                {
+                    for (int j = i + 1; j < hiddenIds.Count; j++)
+                    {
+                        if (rng.NextFloat() < prob)
+                            network.AddConnection(new NNConnection(hiddenIds[i], hiddenIds[j], (rng.NextFloat() * 2f) - 1f));
+                    }
+                }
+
+                // 4. Any Hidden -> Any Output (Random)
+                foreach (var src in hiddenIds)
+                {
+                    foreach (var dst in outputIds)
+                    {
+                        if (rng.NextFloat() < prob)
+                            network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                    }
+                }
+
+                // 5. Direct Input -> Output (Low probability, just to ensure connectivity if hidden is bypassed)
+                // We use prob * 0.5 to make direct connections rarer in this specific architecture
+                foreach (var src in inputIds)
+                {
+                    foreach (var dst in outputIds)
+                    {
+                        if (rng.NextFloat() < (prob * 0.5f))
+                            network.AddConnection(new NNConnection(src, dst, (rng.NextFloat() * 2f) - 1f));
+                    }
+                }
+            }
         }
 
         #endregion

@@ -87,6 +87,20 @@ class SimulationWorker(QObject):
                     except HidraApiException as e:
                         self.signals.status_update.emit(f"Failed to create experiment: {e}", "error")
 
+                elif cmd_type == "CLONE_EXPERIMENT":
+                    if not self.controller or self.controller.is_offline: continue
+                    try:
+                        # Clone the experiment via API
+                        new_exp = self.controller.api_client.experiments.clone(
+                            exp_id=command["source_id"],
+                            name=command["name"],
+                            tick=command["tick"]
+                        )
+                        # Treat it like a newly created experiment for UI updates
+                        self.signals.experiment_created.emit(new_exp)
+                    except HidraApiException as e:
+                        self.signals.status_update.emit(f"Failed to clone experiment: {e}", "error")
+
                 elif cmd_type == "DELETE_EXPERIMENT":
                     if not self.controller or self.controller.is_offline: continue
                     try:

@@ -165,6 +165,13 @@ namespace Hidra.Core
         #region Concurrency Control
         [JsonIgnore]
         private readonly object _worldApiLock = new();
+
+        /// <summary>
+        /// Provides access to the central synchronization root for the world.
+        /// This ensures that the Sprak Bridge and external API calls share the 
+        /// same thread-safety context as the internal simulation loop.
+        /// </summary>
+        internal object SyncRoot => _worldApiLock;
         #endregion
 
         /// <summary>

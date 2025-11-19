@@ -1,44 +1,93 @@
-// In Hidra.API/Controllers/QueryController.cs
+// Hidra.API/Controllers/QueryController.cs
 using Microsoft.AspNetCore.Mvc;
 using Hidra.API.Services;
 using Hidra.Core;
 using System.Linq;
 using System.Text;
 using System.Collections.Generic;
-using Hidra.Core.Logging;
 using System;
 using Hidra.API.DTOs;
 using Hidra.Core.Brain;
-using System.IO;
 using Newtonsoft.Json;
+
+// Explicit alias to resolve ambiguity between Hidra.Core.Logging and Microsoft.Extensions.Logging
+using LogLevel = Hidra.Core.Logging.LogLevel;
 
 namespace Hidra.API.Controllers
 {
     /// <summary>
-    /// Provides endpoints for querying the state of a specific experiment's world, including logs.
+    /// Provides endpoints for querying the state of a specific experiment's world, including logs,
+    /// history replay, and specific entity details.
     /// </summary>
     [ApiController]
     [Route("api/experiments/{expId}/query")]
     public class QueryController : ControllerBase
     {
         private readonly ExperimentManager _manager;
-        private readonly string _baseStoragePath;
 
         public QueryController(ExperimentManager manager)
         {
             _manager = manager;
-            // Get the same root storage path the manager uses to find experiment data
-            _baseStoragePath = Path.Combine(Directory.GetCurrentDirectory(), "_experiments");
         }
 
-        private Experiment? GetExperiment(string expId)
+        private Experiment? GetExperiment(string expId) => _manager.GetExperiment(expId);
+
+        /// <summary>
+        /// Retrieves experiment logs as structured JSON objects from the SQLite database.
+        /// </summary>
+        [HttpGet("logs")]
+        public IActionResult GetExperimentLogs(string expId, [FromQuery] string? level = null, [FromQuery] string? tag = null)
         {
-            return _manager.GetExperiment(expId);
+            var experiment = GetExperiment(expId);
+            if (experiment == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
+
+            // Retrieve from SQLite (limit 2000 for performance)
+            var logs = experiment.Db.ReadLogs(2000); 
+
+            if (!string.IsNullOrWhiteSpace(level) && Enum.TryParse<LogLevel>(level, true, out var minLevel))
+            {
+                logs = logs.Where(e => e.Level >= minLevel).ToList();
+            }
+
+            if (!string.IsNullOrWhiteSpace(tag))
+            {
+                logs = logs.Where(e => e.Tag.Equals(tag, StringComparison.OrdinalIgnoreCase)).ToList();
+            }
+
+            return Ok(logs);
+        }
+        
+        /// <summary>
+        /// Retrieves experiment logs as a single plain text string from the SQLite database.
+        /// </summary>
+        [HttpGet("logs/text")]
+        public IActionResult GetExperimentLogsAsText(string expId, [FromQuery] string? level = null, [FromQuery] string? tag = null)
+        {
+            var experiment = GetExperiment(expId);
+            if (experiment == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
+            
+            var logs = experiment.Db.ReadLogs(2000); 
+            
+            if (!string.IsNullOrWhiteSpace(level) && Enum.TryParse<LogLevel>(level, true, out var minLevel)) 
+            { 
+                logs = logs.Where(e => e.Level >= minLevel).ToList(); 
+            }
+            if (!string.IsNullOrWhiteSpace(tag)) 
+            { 
+                logs = logs.Where(e => e.Tag.Equals(tag, StringComparison.OrdinalIgnoreCase)).ToList(); 
+            }
+
+            var sb = new StringBuilder();
+            foreach (var entry in logs)
+            {
+                sb.AppendLine($"{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{entry.Level,-7}] [{entry.Tag}] {entry.Message}");
+            }
+
+            return Content(sb.ToString(), "text/plain", Encoding.UTF8);
         }
 
         /// <summary>
-        /// Retrieves the complete history of an experiment by reading its persisted state from disk.
-        /// Each frame includes a visualization snapshot and the events for that tick.
+        /// Retrieves the complete history of the experiment by deserializing compressed snapshots from the database.
         /// </summary>
         [HttpGet("history")]
         [ProducesResponseType(typeof(List<ReplayFrameDto>), StatusCodes.Status200OK)]
@@ -51,58 +100,75 @@ namespace Hidra.API.Controllers
                 return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
             }
 
-            var experimentPath = Path.Combine(_baseStoragePath, expId);
-            if (!Directory.Exists(experimentPath))
-            {
-                // This case can happen if an experiment is created but somehow fails before the first save.
-                return Ok(new List<ReplayFrameDto>());
-            }
-            
+            // Retrieve the genome from metadata. This is critical for ensuring the temporary world
+            // used for DTO mapping has the correct genes compiled.
+            string experimentGenome = experiment.Db.GetMetadata("Genome") ?? "";
+
             var history = new List<ReplayFrameDto>();
+            
+            // 1. Load raw compressed JSON from SQLite
+            var snapshots = experiment.Db.LoadAllSnapshots();
 
-            // Find all tick files, sort them numerically by name to ensure correct chronological order.
-            var tickFiles = Directory.GetFiles(experimentPath, "tick_*.json")
-                                     .OrderBy(f => f)
-                                     .ToList();
+            // Settings for the outer wrapper (PersistedTick)
+            var wrapperSettings = new JsonSerializerSettings
+            {
+                TypeNameHandling = TypeNameHandling.Auto,
+                PreserveReferencesHandling = PreserveReferencesHandling.Objects
+            };
 
-            foreach (var filePath in tickFiles)
+            foreach (var (tick, json) in snapshots)
             {
                 try
                 {
-                    var json = System.IO.File.ReadAllText(filePath);
-                    var worldState = JsonConvert.DeserializeObject<FullWorldState>(json);
-
-                    if (worldState != null)
+                    // 2. Deserialize the wrapper to get the raw internal world string and the events
+                    var persistedTick = JsonConvert.DeserializeObject<PersistedTick>(json, wrapperSettings);
+                    
+                    if (persistedTick != null && !string.IsNullOrEmpty(persistedTick.WorldStateJson))
                     {
-                        var frame = new ReplayFrameDto
+                        // 3. Rehydrate a temporary HidraWorld object from the internal JSON string.
+                        // We pass the fetched experimentGenome here.
+                        // We pass dummy config/IO here because we only need the object structure 
+                        // to map it to the Visualization DTO.
+                        var tempWorld = HidraWorld.LoadStateFromJson(
+                            persistedTick.WorldStateJson, 
+                            experimentGenome,   // Ensure genes are loaded
+                            new HidraConfig(),  // Dummy config
+                            new List<ulong>(),  // No IO mapping needed
+                            new List<ulong>()   // No IO mapping needed
+                        );
+
+                        if (tempWorld != null)
                         {
-                            Tick = worldState.CurrentTick,
-                            // GetEventsForTick still reads from the live world's memory, which is correct
-                            // as event history is kept in memory.
-                            Events = experiment.World.GetEventsForTick(worldState.CurrentTick), 
-                            Snapshot = MapWorldStateToVisualizationDto(worldState)
-                        };
-                        history.Add(frame);
+                            // 4. Convert the domain object to the API DTO
+                            var fullState = tempWorld.GetFullWorldState();
+                            
+                            var frame = new ReplayFrameDto
+                            {
+                                Tick = fullState.CurrentTick,
+                                Events = persistedTick.Events,
+                                Snapshot = MapWorldStateToVisualizationDto(fullState)
+                            };
+                            history.Add(frame);
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    // Log an error if a specific file is corrupt, but continue processing others.
-                    Console.WriteLine($"Error processing history file {filePath} for experiment {expId}: {ex.Message}");
+                    Console.WriteLine($"[ERROR] GetFullHistory: Failed to deserialize frame for tick {tick}. Error: {ex.Message}");
                 }
             }
-            
+
             return Ok(history);
         }
 
+        /// <summary>
+        /// Gets the current live status of the experiment.
+        /// </summary>
         [HttpGet("status")]
         public IActionResult GetStatus(string expId)
         {
             var experiment = GetExperiment(expId);
-            if (experiment == null) 
-            {
-                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-            }
+            if (experiment == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
             
             var world = experiment.World;
             return Ok(new
@@ -118,30 +184,38 @@ namespace Hidra.API.Controllers
             });
         }
 
+        [HttpGet("visualize")]
+        public IActionResult GetVisualizationSnapshot(string expId)
+        {
+            var world = GetExperiment(expId)?.World;
+            if (world == null)
+            {
+                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
+            }
+
+            var worldState = world.GetFullWorldState();
+            var snapshotDto = MapWorldStateToVisualizationDto(worldState);
+            return Ok(snapshotDto);
+        }
+
+        #region Entity Getters
+
         [HttpGet("neurons/{id}")]
         public IActionResult GetNeuronById(string expId, ulong id)
         {
             var world = GetExperiment(expId)?.World;
-            if (world == null)
-                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-
+            if (world == null) return NotFound();
             var neuron = world.GetNeuronById(id);
-            if (neuron == null)
-                return NotFound(new { error = "NotFound", message = $"Neuron with ID {id} not found in experiment '{expId}'." });
-
-            return Ok(neuron);
+            return neuron != null ? Ok(neuron) : NotFound();
         }
-
+        
         [HttpGet("neurons")]
         public IActionResult GetNeurons(string expId, [FromQuery] int page = 1, [FromQuery] int pageSize = 100)
         {
             var world = GetExperiment(expId)?.World;
             if (world == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
 
-            var neurons = world.Neurons.Values
-                                .Skip((page - 1) * pageSize)
-                                .Take(pageSize)
-                                .ToList();
+            var neurons = world.Neurons.Values.Skip((page - 1) * pageSize).Take(pageSize).ToList();
             return Ok(neurons);
         }
         
@@ -149,13 +223,11 @@ namespace Hidra.API.Controllers
         public IActionResult GetNeighbors(string expId, [FromQuery] ulong centerId, [FromQuery] float radius)
         {
             var experiment = GetExperiment(expId);
-            if (experiment == null) 
-                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
+            if (experiment == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
             
             var world = experiment.World;
             var centerNeuron = world.GetNeuronById(centerId);
-            if (centerNeuron == null)
-                return NotFound(new { error = "NotFound", message = $"Center neuron with ID {centerId} not found." });
+            if (centerNeuron == null) return NotFound(new { error = "NotFound", message = $"Center neuron with ID {centerId} not found." });
             
             lock (experiment.GetLockObject())
             {
@@ -168,14 +240,10 @@ namespace Hidra.API.Controllers
         public IActionResult GetSynapseById(string expId, ulong id)
         {
             var world = GetExperiment(expId)?.World;
-            if (world == null)
-                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
+            if (world == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
 
             var syn = world.GetSynapseById(id);
-            if (syn == null)
-                return NotFound(new { error = "NotFound", message = $"Synapse with ID {id} not found in experiment '{expId}'." });
-
-            return Ok(syn);
+            return syn != null ? Ok(syn) : NotFound(new { error = "NotFound", message = $"Synapse with ID {id} not found." });
         }
 
         [HttpGet("synapses")]
@@ -184,9 +252,7 @@ namespace Hidra.API.Controllers
             var world = GetExperiment(expId)?.World;
             if (world == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
 
-            var synapses = world.Synapses
-                                .Skip((page - 1) * pageSize)
-                                .Take(pageSize);
+            var synapses = world.Synapses.Skip((page - 1) * pageSize).Take(pageSize);
             return Ok(synapses);
         }
 
@@ -204,45 +270,26 @@ namespace Hidra.API.Controllers
         public IActionResult GetInputNodes(string expId)
         {
             var world = GetExperiment(expId)?.World;
-            if (world == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-            
-            return Ok(world.InputNodes.Values);
+            return world != null ? Ok(world.InputNodes.Values) : NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
         }
 
         [HttpGet("outputs")]
         public IActionResult GetOutputNodes(string expId)
         {
             var world = GetExperiment(expId)?.World;
-            if (world == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-
-            return Ok(world.OutputNodes.Values);
+            return world != null ? Ok(world.OutputNodes.Values) : NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
         }
 
         [HttpGet("hormones")]
         public IActionResult GetGlobalHormones(string expId)
         {
             var world = GetExperiment(expId)?.World;
-            if (world == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-            
-            var gvars = world.GetGlobalHormones();
-            return Ok(gvars);
+            return world != null ? Ok(world.GetGlobalHormones()) : NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
         }
 
-        [HttpGet("visualize")]
-        public IActionResult GetVisualizationSnapshot(string expId)
-        {
-            var world = GetExperiment(expId)?.World;
-            if (world == null)
-            {
-                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-            }
+        #endregion
 
-            var worldState = world.GetFullWorldState();
-            var snapshotDto = MapWorldStateToVisualizationDto(worldState);
-            return Ok(snapshotDto);
-        }
-        
-        #region Private Controller Helpers for DTO Mapping
+        #region DTO Mapping Helpers
 
         private VisualizationSnapshotDto MapWorldStateToVisualizationDto(FullWorldState worldState)
         {
@@ -323,7 +370,7 @@ namespace Hidra.API.Controllers
                         Type = "LogicGateBrain",
                         Data = new LGBrainDataDto
                         {
-                            GateType = (int)lgBrain.GateType, // Explicitly cast the enum to an int
+                            GateType = (int)lgBrain.GateType, 
                             FlipFlop = lgBrain.FlipFlop,
                             Threshold = lgBrain.Threshold
                         }
@@ -342,65 +389,6 @@ namespace Hidra.API.Controllers
                 return network.Nodes.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Value);
             }
             return null;
-        }
-        #endregion
-
-        #region Log Endpoints
-
-        [HttpGet("logs")]
-        public IActionResult GetExperimentLogs(
-            string expId,
-            [FromQuery] string? level = null,
-            [FromQuery] string? tag = null)
-        {
-            var experiment = GetExperiment(expId);
-            if (experiment == null) 
-                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-
-            IEnumerable<LogEntry> logs;
-            lock (experiment.LogHistory)
-            {
-                logs = experiment.LogHistory.ToList();
-            }
-
-            if (!string.IsNullOrWhiteSpace(level) && Enum.TryParse<Hidra.Core.Logging.LogLevel>(level, true, out var minLevel))
-            {
-                logs = logs.Where(e => e.Level >= minLevel);
-            }
-
-            if (!string.IsNullOrWhiteSpace(tag))
-            {
-                logs = logs.Where(e => e.Tag.Equals(tag, StringComparison.OrdinalIgnoreCase));
-            }
-
-            return Ok(logs);
-        }
-
-        [HttpGet("logs/text")]
-        public IActionResult GetExperimentLogsAsText(
-            string expId,
-            [FromQuery] string? level = null,
-            [FromQuery] string? tag = null)
-        {
-            var experiment = GetExperiment(expId);
-            if (experiment == null) return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found." });
-            
-            IEnumerable<LogEntry> logs;
-            lock (experiment.LogHistory) { logs = experiment.LogHistory.ToList(); }
-            
-            if (!string.IsNullOrWhiteSpace(level) && Enum.TryParse<Hidra.Core.Logging.LogLevel>(level, true, out var minLevel)) 
-            { 
-                logs = logs.Where(e => e.Level >= minLevel); 
-            }
-            if (!string.IsNullOrWhiteSpace(tag)) { logs = logs.Where(e => e.Tag.Equals(tag, StringComparison.OrdinalIgnoreCase)); }
-
-            var sb = new StringBuilder();
-            foreach (var entry in logs)
-            {
-                sb.AppendLine($"{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{entry.Level,-7}] [{entry.Tag}] {entry.Message}");
-            }
-
-            return Content(sb.ToString(), "text/plain", Encoding.UTF8);
         }
 
         #endregion

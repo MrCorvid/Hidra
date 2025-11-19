@@ -10,7 +10,7 @@ class ExperimentsClient:
     """
     Provides methods for the ExperimentsController endpoints.
     
-    This client allows for creating, listing, retrieving, and deleting experiments.
+    This client allows for creating, listing, retrieving, deleting, and cloning experiments.
     """
     def __init__(self, api_client: 'HidraApiClient'):
         self._api_client = api_client
@@ -67,6 +67,21 @@ class ExperimentsClient:
             "name": name
         }
         return self._api_client._request("POST", "api/experiments/restore", json=payload)
+
+    def clone(self, exp_id: str, name: str, tick: int) -> Dict[str, Any]:
+        """
+        Clones an existing experiment starting from a specific tick.
+        
+        Args:
+            exp_id (str): The ID of the source experiment.
+            name (str): The name for the new experiment.
+            tick (int): The specific tick to clone from.
+            
+        Returns:
+            Dict[str, Any]: The details of the newly created experiment.
+        """
+        payload = {"name": name, "tick": tick}
+        return self._api_client._request("POST", f"api/experiments/{exp_id}/clone", json=payload)
         
     def list(self, state: Optional[str] = None) -> List[Dict[str, Any]]:
         """

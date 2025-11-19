@@ -110,6 +110,7 @@ HidraApiTest_*/
 
 # Default output directory for saved experiments
 [Ee]xperiments/
+_[Ee]xperiments/
 
 # Run counter file for experiment serialization
 run_counter.txt

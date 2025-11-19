@@ -37,137 +37,61 @@ class Renderer3D(QWidget):
         self.input_ids_cache = set()
         self.output_ids_cache = set()
         
-        # Enable point picking with a callback that should work with QtInteractor
-        # Note: By default, point picking uses right-click. We can change this behavior.
-        self.plotter.enable_point_picking(callback=self._on_point_picked, use_airtight=True, show_point=False)
+        # Enable point picking. 
+        # 'use_mesh' ensures the mesh is passed to the callback.
+        # 'show_message=False' prevents the default overlay text.
+        self.plotter.enable_point_picking(
+            callback=self._on_pick, 
+            show_message=False,
+            use_mesh=True,
+            show_point=False
+        )
         
-        # Change picking to left-click instead of right-click
-        self.plotter.picker.SetTolerance(0.005)  # Make picking a bit more forgiving
-        
-        # Also try adding a direct VTK observer as backup
-        self.plotter.iren.add_observer("LeftButtonPressEvent", self._on_mouse_click)
+        # Increase tolerance to make clicking neurons (points) easier.
+        # 0.02 represents 2% of the render window diagonal.
+        if hasattr(self.plotter, 'picker'):
+            self.plotter.picker.SetTolerance(0.02)
 
-    def _on_mouse_click(self, obj, event):
+    def _on_pick(self, mesh, idx):
         """
-        Basic mouse click detection - this should always fire.
+        Callback triggered by PyVista when a point is picked.
+        Args:
+            mesh: The PyVista mesh object that was clicked.
+            idx: The index of the point within that mesh.
         """
-        print("DEBUG: Mouse click detected via VTK observer!")
-        
-    def _on_point_picked(self, picked_point):
-        """
-        PyVista's callback for point picking.
-        """
-        print("DEBUG: Point picked via PyVista callback!")
-        self._process_pick_result()
+        if mesh is None or idx is None or idx < 0:
+            return
 
-    def _process_pick_result(self, picked_point=None):
-        """
-        Processes the result of a pick operation using PyVista's built-in picking.
-        """
-        print("DEBUG: Processing pick result...")
-        
-        # Check different possible attributes for QtInteractor
-        picked_mesh = getattr(self.plotter, 'picked_mesh', None)
-        picked_actor = getattr(self.plotter, 'picked_actor', None)
-        picked_point_coords = getattr(self.plotter, 'picked_point', None)
-        picked_point_id = getattr(self.plotter, 'picked_point_id', None)
-        
-        print(f"DEBUG: picked_mesh: {picked_mesh}")
-        print(f"DEBUG: picked_actor: {picked_actor}")
-        print(f"DEBUG: picked_point_coords: {picked_point_coords}")
-        print(f"DEBUG: picked_point_id: {picked_point_id}")
-        
-        # Try to get the mesh from the actor if mesh is None
-        if picked_mesh is None and picked_actor is not None:
-            # Get the mapper from the actor to find the mesh
-            mapper = picked_actor.GetMapper()
-            if mapper:
-                picked_mesh = mapper.GetInput()
-                print(f"DEBUG: Got mesh from actor: {picked_mesh}")
-        
-        # Check the plotter's picker for additional info
-        if hasattr(self.plotter, 'picker') and self.plotter.picker:
-            picker = self.plotter.picker
-            picked_point_id = getattr(picker, 'GetPointId', lambda: -1)()
-            print(f"DEBUG: Picker point ID: {picked_point_id}")
+        try:
+            # Check if this mesh has our custom object IDs
+            if 'object_ids' not in mesh.point_data:
+                return
+
+            obj_ids_array = mesh.point_data['object_ids']
             
-            # Try to get the picked data set
-            picked_dataset = getattr(picker, 'GetDataSet', lambda: None)()
-            if picked_dataset:
-                picked_mesh = picked_dataset
-                print(f"DEBUG: Got mesh from picker: {picked_mesh}")
-
-        if picked_mesh and hasattr(picked_mesh, 'GetPointData') and picked_point_id is not None and picked_point_id >= 0:
-            try:
-                point_data = picked_mesh.GetPointData()
-                print(f"DEBUG: Point data arrays: {[point_data.GetArrayName(i) for i in range(point_data.GetNumberOfArrays())]}")
+            if idx < len(obj_ids_array):
+                encoded_id = int(obj_ids_array[idx])
                 
-                # Try different ways to get the arrays
-                obj_ids_array = None
-                obj_types_array = None
+                # Decode the ID
+                # 20000+ = Output Node
+                # 10000+ = Neuron
+                # 0-9999 = Input Node
                 
-                # Method 1: By name
-                for i in range(point_data.GetNumberOfArrays()):
-                    array_name = point_data.GetArrayName(i)
-                    array = point_data.GetArray(i)
-                    print(f"DEBUG: Array {i}: name='{array_name}', array={array}")
-                    
-                    if array_name == 'object_ids':
-                        obj_ids_array = array
-                        if obj_ids_array:
-                            print(f"DEBUG: Found object_ids array with {obj_ids_array.GetNumberOfTuples()} values")
-                    elif array_name == 'object_types':
-                        obj_types_array = array
-                        if obj_types_array:
-                            print(f"DEBUG: Found object_types array with {obj_types_array.GetNumberOfTuples()} values")
-                        else:
-                            print("DEBUG: object_types array is None")
-                
-                if obj_ids_array and picked_point_id < obj_ids_array.GetNumberOfTuples():
-                    encoded_id = int(obj_ids_array.GetValue(picked_point_id))
-                    
-                    # Decode the ID to get original type and ID
-                    if encoded_id >= 20000:
-                        obj_type = "output"
-                        obj_id = encoded_id - 20000
-                    elif encoded_id >= 10000:
-                        obj_type = "neuron"
-                        obj_id = encoded_id - 10000
-                    else:
-                        obj_type = "input"
-                        obj_id = encoded_id
-                    
-                    # Try to get object_types array if available, but don't rely on it
-                    if obj_types_array and picked_point_id < obj_types_array.GetNumberOfTuples():
-                        try:
-                            obj_type_raw = obj_types_array.GetValue(picked_point_id)
-                            if hasattr(obj_type_raw, 'decode'):
-                                obj_type_from_array = obj_type_raw.decode('utf-8')
-                            else:
-                                obj_type_from_array = str(obj_type_raw)
-                            print(f"DEBUG: Type from array: {obj_type_from_array}, Type from ID: {obj_type}")
-                        except Exception as e:
-                            print(f"DEBUG: Error getting object type from array: {e}")
-                    
-                    print(f"DEBUG: Selected object - Type: {obj_type}, ID: {obj_id} (encoded as {encoded_id})")
-                    print("DEBUG: About to emit object_selected signal")
-                    self.object_selected.emit(obj_type, obj_id)
-                    print("DEBUG: Signal emitted successfully")
+                if encoded_id >= 20000:
+                    obj_type = "output"
+                    obj_id = encoded_id - 20000
+                elif encoded_id >= 10000:
+                    obj_type = "neuron"
+                    obj_id = encoded_id - 10000
                 else:
-                    print(f"DEBUG: Arrays not found or invalid point ID")
-                    print(f"DEBUG: obj_ids_array: {obj_ids_array is not None}")
-                    print(f"DEBUG: obj_types_array: {obj_types_array is not None}")
-                    print(f"DEBUG: picked_point_id: {picked_point_id}")
-                    if obj_ids_array:
-                        print(f"DEBUG: Array size: {obj_ids_array.GetNumberOfTuples()}")
-            except Exception as e:
-                print(f"DEBUG: Error retrieving pick data: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print("DEBUG: No valid pick result found")
-            print(f"DEBUG: picked_mesh valid: {picked_mesh is not None}")
-            print(f"DEBUG: picked_point_id valid: {picked_point_id is not None and picked_point_id >= 0}")
+                    obj_type = "input"
+                    obj_id = encoded_id
+                
+                print(f"INFO: Picked {obj_type} {obj_id}")
+                self.object_selected.emit(obj_type, obj_id)
+
+        except Exception as e:
+            print(f"ERROR: Picking logic failed: {e}")
 
     def clear_scene(self):
         for actor in self.actors:
@@ -177,29 +101,44 @@ class Renderer3D(QWidget):
     
     def display_payload(self, payload: RenderPayload):
         new_actors = []
-
+        
         def _add_and_track_actor(pickable, *args, **kwargs):
+            # Ensure pickable is explicitly passed. 
+            # render_points_as_spheres is visual only; the underlying geometry is still points.
             actor = self.plotter.add_mesh(*args, **kwargs, render=False, pickable=pickable)
             new_actors.append(actor)
 
-        if payload.idle_neurons: _add_and_track_actor(True, payload.idle_neurons, color='#6666CC', render_points_as_spheres=True, point_size=36)
-        if payload.firing_neurons: _add_and_track_actor(True, payload.firing_neurons, color='yellow', render_points_as_spheres=True, point_size=36)
-        if payload.executing_neurons: _add_and_track_actor(True, payload.executing_neurons, color='red', render_points_as_spheres=True, point_size=36)
-        if payload.both_neurons: _add_and_track_actor(True, payload.both_neurons, color='white', render_points_as_spheres=True, point_size=36)
+        # Render Neurons (Pickable)
+        if payload.idle_neurons: 
+            _add_and_track_actor(True, payload.idle_neurons, color='#6666CC', render_points_as_spheres=True, point_size=36)
+        if payload.firing_neurons: 
+            _add_and_track_actor(True, payload.firing_neurons, color='yellow', render_points_as_spheres=True, point_size=36)
+        if payload.executing_neurons: 
+            _add_and_track_actor(True, payload.executing_neurons, color='red', render_points_as_spheres=True, point_size=36)
+        if payload.both_neurons: 
+            _add_and_track_actor(True, payload.both_neurons, color='white', render_points_as_spheres=True, point_size=36)
         
-        if payload.input_nodes: _add_and_track_actor(True, payload.input_nodes, color='#33CC33', render_points_as_spheres=True, point_size=24)
-        if payload.output_nodes: _add_and_track_actor(True, payload.output_nodes, color='#CC3333', render_points_as_spheres=True, point_size=24)
+        # Render I/O Nodes (Pickable)
+        if payload.input_nodes: 
+            _add_and_track_actor(True, payload.input_nodes, color='#33CC33', render_points_as_spheres=True, point_size=24)
+        if payload.output_nodes: 
+            _add_and_track_actor(True, payload.output_nodes, color='#CC3333', render_points_as_spheres=True, point_size=24)
         
+        # Render Selection Highlight (Not Pickable)
         if payload.selection_highlight:
             _add_and_track_actor(False, payload.selection_highlight, color='white', render_points_as_spheres=True, point_size=42, opacity=0.8)
 
-        if payload.active_io_glow: _add_and_track_actor(False, payload.active_io_glow, color='yellow', render_points_as_spheres=True, point_size=30, opacity=0.3)
+        # Render Glows (Not Pickable)
+        if payload.active_io_glow: 
+            _add_and_track_actor(False, payload.active_io_glow, color='yellow', render_points_as_spheres=True, point_size=30, opacity=0.3)
         
+        # Render Synapses (Not Pickable for now to avoid clutter)
         if payload.normal_synapses: _add_and_track_actor(False, payload.normal_synapses, color=(0.5, 0.5, 0.6))
         if payload.normal_arrows: _add_and_track_actor(False, payload.normal_arrows, color=(0.5, 0.5, 0.6))
         if payload.firing_synapses: _add_and_track_actor(False, payload.firing_synapses, color='yellow')
         if payload.firing_arrows: _add_and_track_actor(False, payload.firing_arrows, color='yellow')
 
+        # Cleanup old actors to free memory
         for old_actor in self.actors:
             self.plotter.remove_actor(old_actor, render=False)
         

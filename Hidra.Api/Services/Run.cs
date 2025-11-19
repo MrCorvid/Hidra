@@ -1,6 +1,8 @@
+// Hidra.API/Services/Run.cs
 using Hidra.Core;
 using Hidra.API.DTOs;
 using System;
+using System.Threading;
 
 namespace Hidra.API.Services
 {
@@ -9,21 +11,16 @@ namespace Hidra.API.Services
         Pending,
         Running,
         Completed,
-        Failed
+        Failed,
+        Aborted
     }
 
-    /// <summary>
-    /// Represents a single, auditable execution segment within an Experiment.
-    /// It encapsulates the parameters, status, and outcome of a specific run command.
-    /// </summary>
     public class Run
     {
-        // --- Identity and Status ---
         public string Id { get; }
         public RunStatus Status { get; private set; }
         public string CompletionReason { get; private set; } = "N/A";
         
-        // --- Auditing Information ---
         public CreateRunRequestDto Request { get; }
         public DateTime StartTime { get; private set; }
         public DateTime EndTime { get; private set; }
@@ -31,6 +28,9 @@ namespace Hidra.API.Services
         public ulong EndTick { get; private set; }
 
         private readonly Experiment _parentExperiment;
+
+        // How many ticks to execute before momentarily releasing the lock
+        private const int TICK_CHUNK_SIZE = 100; 
 
         public Run(Experiment parentExperiment, CreateRunRequestDto request)
         {
@@ -41,11 +41,11 @@ namespace Hidra.API.Services
         }
 
         /// <summary>
-        /// Executes the run. This is a synchronous, blocking call.
+        /// Executes the run logic. Now designed to run on a background Task.
         /// </summary>
         public void Execute()
         {
-            // Lock the parent experiment to ensure no other actions can interfere.
+            // Initial Setup - Atomic check
             lock (_parentExperiment.GetLockObject())
             {
                 if (_parentExperiment.State != SimulationState.Idle)
@@ -57,81 +57,141 @@ namespace Hidra.API.Services
 
                 try
                 {
-                    // --- PRE-RUN SETUP ---
                     Status = RunStatus.Running;
                     StartTime = DateTime.UtcNow;
                     StartTick = _parentExperiment.World.CurrentTick;
 
-                    // Atomically apply staged inputs and hormones
+                    // Apply inputs/hormones once at start
                     if (Request.StagedInputs != null)
                         _parentExperiment.World.SetInputValues(Request.StagedInputs);
                     if (Request.StagedHormones != null)
                         _parentExperiment.World.SetGlobalHormones(Request.StagedHormones);
-                    
-                    // --- EXECUTION LOGIC ---
-                    if (Request.Type.Equals("runFor", StringComparison.OrdinalIgnoreCase))
-                    {
-                        ExecuteRunFor();
-                    }
-                    else if (Request.Type.Equals("runUntil", StringComparison.OrdinalIgnoreCase))
-                    {
-                        ExecuteRunUntil();
-                    }
-                    else
-                    {
-                        throw new NotSupportedException($"Run type '{Request.Type}' is not supported.");
-                    }
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
                     Status = RunStatus.Failed;
-                    CompletionReason = $"An exception occurred during execution: {ex.Message}";
+                    CompletionReason = $"Initialization failed: {ex.Message}";
+                    return;
                 }
-                finally
+            }
+
+            try
+            {
+                if (Request.Type.Equals("runFor", StringComparison.OrdinalIgnoreCase))
                 {
-                    // --- POST-RUN CLEANUP ---
-                    if (Status == RunStatus.Running) // If it didn't fail
+                    ExecuteRunFor();
+                }
+                else if (Request.Type.Equals("runUntil", StringComparison.OrdinalIgnoreCase))
+                {
+                    ExecuteRunUntil();
+                }
+                else
+                {
+                    throw new NotSupportedException($"Run type '{Request.Type}' is not supported.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Status = RunStatus.Failed;
+                CompletionReason = $"Execution error: {ex.Message}";
+            }
+            finally
+            {
+                // Finalize state
+                lock (_parentExperiment.GetLockObject())
+                {
+                    EndTick = _parentExperiment.World.CurrentTick;
+                    EndTime = DateTime.UtcNow;
+                    
+                    // Only mark completed if not already Failed/Aborted
+                    if (Status == RunStatus.Running)
                     {
                         Status = RunStatus.Completed;
                     }
-                    EndTick = _parentExperiment.World.CurrentTick;
-                    EndTime = DateTime.UtcNow;
                 }
+                
+                // Save final state
+                try { _parentExperiment.SaveCurrentTickState(); } catch { /* Ignore IO errors on final save */ }
             }
         }
 
         private void ExecuteRunFor()
         {
-            int ticksToRun = Request.Parameters.Ticks ?? 
-                             throw new ArgumentNullException(nameof(Request.Parameters.Ticks), "runFor requires a 'ticks' parameter.");
+            int ticksTotal = Request.Parameters.Ticks ?? throw new ArgumentNullException("ticks");
+            int ticksExecuted = 0;
 
-            for (int i = 0; i < ticksToRun; i++)
+            while (ticksExecuted < ticksTotal)
             {
-                _parentExperiment.World.Step();
+                // Execute a chunk
+                int chunk = Math.Min(TICK_CHUNK_SIZE, ticksTotal - ticksExecuted);
+                
+                lock (_parentExperiment.GetLockObject())
+                {
+                    // Safety check: If user manually Stopped the experiment via API during the run
+                    if (_parentExperiment.State != SimulationState.Idle && _parentExperiment.State != SimulationState.Running)
+                    {
+                        Status = RunStatus.Aborted;
+                        CompletionReason = "Experiment state changed externally.";
+                        return;
+                    }
+
+                    for (int i = 0; i < chunk; i++)
+                    {
+                        _parentExperiment.World.Step();
+                    }
+                }
+
+                ticksExecuted += chunk;
+
+                // Optional: Save state occasionally (e.g., every 10 chunks) to avoid data loss on crash
+                if (ticksExecuted % (TICK_CHUNK_SIZE * 10) == 0)
+                {
+                     _parentExperiment.SaveCurrentTickState();
+                }
+
+                // Yield to allow other threads (API reads) to acquire the lock if needed
+                Thread.Sleep(1);
             }
-            CompletionReason = $"Completed {ticksToRun} ticks.";
+            CompletionReason = $"Completed {ticksTotal} ticks.";
         }
         
         private void ExecuteRunUntil()
         {
-            var predicateDto = Request.Parameters.Predicate ?? 
-                               throw new ArgumentNullException(nameof(Request.Parameters.Predicate), "runUntil requires a 'predicate' parameter.");
+            var predicateDto = Request.Parameters.Predicate ?? throw new ArgumentNullException("predicate");
+            var maxTicks = Request.Parameters.MaxTicks ?? throw new ArgumentNullException("maxTicks");
             
-            var maxTicks = Request.Parameters.MaxTicks ?? 
-                           throw new ArgumentNullException(nameof(Request.Parameters.MaxTicks), "runUntil requires a 'maxTicks' parameter.");
-
             Func<HidraWorld, bool> stopCondition = BuildPredicate(predicateDto);
 
-            for (int i = 0; i < maxTicks; i++)
+            int ticksExecuted = 0;
+            bool conditionMet = false;
+
+            while (ticksExecuted < maxTicks && !conditionMet)
             {
-                _parentExperiment.World.Step();
-                if (stopCondition(_parentExperiment.World))
+                // Process one tick at a time or small chunks to check predicate
+                lock (_parentExperiment.GetLockObject())
                 {
-                    CompletionReason = "Predicate met.";
-                    return; // Exit successfully
+                     if (_parentExperiment.State != SimulationState.Idle && _parentExperiment.State != SimulationState.Running)
+                    {
+                        Status = RunStatus.Aborted;
+                        CompletionReason = "Experiment state changed externally.";
+                        return;
+                    }
+
+                    _parentExperiment.World.Step();
+                    
+                    if (stopCondition(_parentExperiment.World))
+                    {
+                        conditionMet = true;
+                    }
                 }
+                
+                ticksExecuted++;
+                
+                // Yield every 100 ticks
+                if (ticksExecuted % 100 == 0) Thread.Sleep(1);
             }
-            CompletionReason = "MaxTicks reached.";
+
+            CompletionReason = conditionMet ? "Predicate met." : "MaxTicks reached.";
         }
 
         private Func<HidraWorld, bool> BuildPredicate(PredicateDto predicateDto)
@@ -140,9 +200,7 @@ namespace Hidra.API.Services
             {
                 "outputabove" => (world) =>
                 {
-                    if (!predicateDto.OutputId.HasValue || !predicateDto.Value.HasValue)
-                        throw new ArgumentException("Predicate 'outputAbove' requires 'outputId' and 'value'.");
-                    
+                    if (!predicateDto.OutputId.HasValue || !predicateDto.Value.HasValue) return false;
                     var outputNode = world.GetOutputNodeById(predicateDto.OutputId.Value);
                     return outputNode != null && outputNode.Value > predicateDto.Value.Value;
                 },

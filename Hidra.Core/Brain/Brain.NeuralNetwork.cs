@@ -79,11 +79,12 @@ namespace Hidra.Core.Brain
         public void Mutate(float rate)
         {
             if (_prng == null) return;
-            _isDirty = true; // A mutation might eventually change the structure, so be safe.
+            _isDirty = true;
 
             // Mutate a connection weight
             if (_neuralNetwork.Connections.Any())
             {
+                // Connections is a List, which maintains deterministic order from load/creation.
                 int index = _prng.NextInt(0, _neuralNetwork.Connections.Count);
                 _neuralNetwork.Connections[index].Weight += (_prng.NextFloat() * 2f - 1f) * rate;
             }
@@ -91,10 +92,15 @@ namespace Hidra.Core.Brain
             // Mutate a node bias
             if (_neuralNetwork.Nodes.Any())
             {
-                // Can't guarantee dictionary order, so we convert to a list for deterministic selection.
-                var nodeList = _neuralNetwork.Nodes.Values.ToList(); 
-                int index = _prng.NextInt(0, nodeList.Count);
-                nodeList[index].Bias += (_prng.NextFloat() * 2f - 1f) * rate;
+                // Dictionary.Values is not guaranteed to be deterministic across runtimes.
+                // We explicitly sort by Node ID (Key) before selecting an index for mutation.
+                var sortedNodes = _neuralNetwork.Nodes
+                    .OrderBy(kvp => kvp.Key)
+                    .Select(kvp => kvp.Value)
+                    .ToList();
+
+                int index = _prng.NextInt(0, sortedNodes.Count);
+                sortedNodes[index].Bias += (_prng.NextFloat() * 2f - 1f) * rate;
             }
         }
         

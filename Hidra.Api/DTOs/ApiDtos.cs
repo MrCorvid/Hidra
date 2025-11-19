@@ -1,4 +1,4 @@
-// In Hidra.API/DTOs/ApiDtos.cs
+// Hidra.API/DTOs/ApiDtos.cs
 using Hidra.Core;
 using Hidra.Core.Brain;
 using System.Collections.Generic;
@@ -25,6 +25,21 @@ namespace Hidra.API.DTOs
         public required string HGLGenome { get; set; }
         public required HidraConfig Config { get; set; }
         public required IOConfigDto IOConfig { get; set; }
+    }
+
+    public class CloneExperimentRequestDto
+    {
+        /// <summary>
+        /// The name for the new, cloned experiment.
+        /// </summary>
+        public string Name { get; set; } = "cloned-experiment";
+
+        /// <summary>
+        /// The tick at which to clone the experiment. 
+        /// History up to this tick is kept; history after is discarded.
+        /// The world state will start exactly at this tick.
+        /// </summary>
+        public ulong Tick { get; set; }
     }
     
     public class CreateRunRequestDto
@@ -287,7 +302,7 @@ namespace Hidra.API.DTOs
     /// </summary>
     public class LGBrainDataDto
     {
-        public int GateType { get; set; } // Change this to int
+        public int GateType { get; set; } 
         public FlipFlopType? FlipFlop { get; set; }
         public float Threshold { get; set; }
     }
@@ -309,5 +324,21 @@ namespace Hidra.API.DTOs
     {
         public bool IsActive { get; set; }
         public float FatigueLevel { get; set; }
+    }
+
+    /// <summary>
+    /// A container used for persistence that bundles the world state 
+    /// with the events processed during the tick that produced this state.
+    /// </summary>
+    public class PersistedTick
+    {
+        /// <summary>
+        /// The raw JSON string of the HidraWorld's internal state.
+        /// We store the raw string because the internal state (Private Fields) differs 
+        /// from the public DTOs, and we need the internal state for server restarts.
+        /// </summary>
+        public required string WorldStateJson { get; set; }
+        
+        public required List<Event> Events { get; set; }
     }
 }

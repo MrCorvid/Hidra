@@ -93,12 +93,18 @@ namespace Hidra.API.Controllers
                 }
 
                 ulong previousTick = exp.World.CurrentTick;
+                
+                // 1. Apply inputs and advance world
                 exp.World.ApplyInputsAndStep(body.Inputs);
                 
+                // 2. CRITICAL FIX: Persist this new state to the DB immediately.
+                // This ensures that if the visualizer reconnects, this step exists in history.
+                exp.SaveCurrentTickState();
+
                 response = new AtomicStepResponseDto
                 {
                     NewTick = exp.World.CurrentTick,
-                    // --- FIX: Return the events for the tick that was just processed, not the new (empty) one ---
+                    // Return the events that occurred during the transition from prev -> current
                     EventsProcessed = exp.World.GetEventsForTick(previousTick),
                     OutputValues = exp.World.GetOutputValues(body.OutputIdsToRead)
                 };
