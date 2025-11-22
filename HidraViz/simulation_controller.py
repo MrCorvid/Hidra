@@ -26,15 +26,19 @@ class SimulationController:
         """
         Connects to a live experiment and downloads its full history.
         """
+        # Clear previous data for this ID to ensure a fresh start
         if exp_id in self._data_store:
             del self._data_store[exp_id]
+            
         try:
+            # Verify existence
             self.api_client.query.get_status(exp_id)
             self.log_message(f"Successfully connected to experiment '{exp_id}'. Downloading full history...")
+            
             self._data_store[exp_id] = {}
             self.is_offline = False
             
-            # This function now contains validation logic to ensure we actually got data
+            # Download history
             self._capture_full_history(exp_id)
             
             return True
@@ -42,12 +46,31 @@ class SimulationController:
             self.log_message(f"Failed to connect to experiment '{exp_id}': {e}", level="error")
             return False
 
+    def refresh_history(self, exp_id: str) -> int:
+        """
+        Refreshes the history for an existing connection without clearing local state.
+        Returns the number of frames fetched.
+        """
+        if self.is_offline:
+            return 0
+            
+        # Ensure the dict exists
+        if exp_id not in self._data_store:
+            self._data_store[exp_id] = {}
+            
+        self.log_message(f"[{exp_id}] Refreshing history...")
+        count = self._capture_full_history(exp_id)
+        return count
+
     def disconnect(self, exp_id: str):
         if exp_id in self._data_store:
             del self._data_store[exp_id]
             self.log_message(f"Disconnected from experiment '{exp_id}'. Data cleared.")
 
     def _parse_events(self, raw_events_data: Any) -> List[Dict[str, Any]]:
+        """
+        Parses the event list, handling potential serialization wrappers (e.g. $values).
+        """
         if not raw_events_data: 
             return []
         
@@ -63,84 +86,83 @@ class SimulationController:
                 try: 
                     processed_events.append(json.loads(event))
                 except json.JSONDecodeError: 
-                    processed_events.append({"$type": "InvalidEventFormat", "data": event})
+                    processed_events.append({"type": "InvalidEventFormat", "data": event})
             elif isinstance(event, dict): 
                 processed_events.append(event)
         
         return processed_events
 
-    def _capture_full_history(self, exp_id: str):
+    def _capture_full_history(self, exp_id: str) -> int:
         """
-        Downloads and stores the full history. Includes robustness checks for JSON casing
-        and empty responses.
+        Downloads and stores the full history. Returns count of frames processed.
         """
-        history_frames = self.api_client.query.get_full_history(exp_id)
-        
-        count = len(history_frames)
-        self.log_message(f"[{exp_id}] History download complete. Received {count} frames.")
+        try:
+            history_frames = self.api_client.query.get_full_history(exp_id)
+        except HidraApiException as e:
+            self.log_message(f"[{exp_id}] Failed to download history: {e}", level="error")
+            return 0
 
+        count = len(history_frames)
         if count == 0:
-            self.log_message(f"[{exp_id}] WARNING: Server returned 0 history frames. The experiment may be corrupted or failed to deserialize on the server.", level="warning")
-            return
+            return 0
 
         for i, frame_data in enumerate(history_frames):
-            # Triple Check: Handle both camelCase (standard) and PascalCase (legacy/default)
-            # to prevent silent failures during parsing.
             tick = frame_data.get('tick', frame_data.get('Tick'))
             snapshot = frame_data.get('snapshot', frame_data.get('Snapshot'))
             events_raw = frame_data.get('events', frame_data.get('Events', []))
 
             if tick is None or snapshot is None:
-                self.log_message(f"[{exp_id}] Error parsing frame {i}: Missing 'tick' or 'snapshot' fields.", level="error")
                 continue
 
             frame = ReplayFrame(
-                tick=tick,
+                tick=int(tick),
                 snapshot=snapshot,
                 events=self._parse_events(events_raw)
             )
+            # Overwrite or add
             self._data_store[exp_id][frame.tick] = frame
+            
+        self.log_message(f"[{exp_id}] History sync complete. {count} frames available.")
+        return count
 
     def _capture_frame(self, exp_id: str) -> Optional[ReplayFrame]:
-        snapshot = self.api_client.query.get_visualization_snapshot(exp_id)
+        """Captures the *current* live state as a new frame."""
+        try:
+            snapshot = self.api_client.query.get_visualization_snapshot(exp_id)
+        except HidraApiException:
+            return None
         
-        # Robust key access for the snapshot as well
         current_tick = snapshot.get('currentTick', snapshot.get('CurrentTick'))
         
         if current_tick is None:
-            self.log_message(f"[{exp_id}] Failed to capture frame: Snapshot missing 'currentTick'.", level="error")
             return None
 
         frame = ReplayFrame(tick=current_tick, snapshot=snapshot, events=[])
         self._data_store[exp_id][current_tick] = frame
-        self.log_message(f"[{exp_id}] Captured new frame for Tick {current_tick}.")
         return frame
 
     def step_with_inputs(self, exp_id: str, inputs: Dict[int, float], outputs_to_read: List[int]) -> Optional[ReplayFrame]:
         """
-        Advances the simulation by one step with the provided inputs.
+        Advances the simulation by one step with the provided inputs using AtomicStep.
         """
         if self.is_offline or exp_id not in self._data_store:
             return None
         
         try:
             response = self.api_client.run_control.atomic_step(exp_id, inputs, outputs_to_read)
-            
-            # Capture the new simulation state
             new_frame = self._capture_frame(exp_id)
             
             if new_frame:
-                # Handle casing for eventsProcessed
                 raw_events_data = response.get("eventsProcessed", response.get("EventsProcessed", []))
                 new_frame.events = self._parse_events(raw_events_data)
-                
-                completed_tick = new_frame.tick - 1 if new_frame.tick > 0 else 0
-                self.log_message(f"[{exp_id}] Step completed. Events from tick {completed_tick} displayed on frame {new_frame.tick}.")
+                self.log_message(f"[{exp_id}] Step to Tick {new_frame.tick} successful.")
 
             return new_frame
 
         except HidraApiException as e:
             self.log_message(f"API Error during step: {e}", level="error")
+            # Raise or return None? Controller usually swallows and logs.
+            # But worker might need to know to stop playback.
             return None
 
     def is_latest_tick(self, exp_id: str, tick: int) -> bool:
@@ -158,12 +180,6 @@ class SimulationController:
     def get_frame(self, exp_id: str, tick: int) -> Optional[ReplayFrame]:
         return self._data_store.get(exp_id, {}).get(tick)
 
-    def get_first_frame(self, exp_id: str) -> Optional[ReplayFrame]:
-        if exp_id not in self._data_store or not self._data_store[exp_id]:
-            return None
-        first_tick = min(self._data_store[exp_id].keys())
-        return self._data_store[exp_id][first_tick]
-
     def get_full_history(self, exp_id: str) -> List[ReplayFrame]:
         if exp_id not in self._data_store: 
             return []
@@ -173,7 +189,7 @@ class SimulationController:
     def save_replay_to_file(self, exp_id: str, filename: str):
         history = self.get_full_history(exp_id)
         if not history:
-            raise ValueError("No history to save for this experiment.")
+            raise ValueError("No history to save.")
         
         first_snapshot = history[0].snapshot
         metadata = {
@@ -196,7 +212,6 @@ class SimulationController:
         metadata = data.get("metadata", {})
         exp_id = metadata.get("experimentId")
         if not exp_id:
-            self.log_message("Replay file is missing 'experimentId'.", level="error")
             return None
         
         exp_name = metadata.get("experimentName", "loaded-replay")
@@ -206,7 +221,6 @@ class SimulationController:
         self._data_store[exp_id] = {}
         
         for frame_data in frames_data:
-            # Replays saved from file also need robust key checking just in case
             tick = frame_data.get('tick', frame_data.get('Tick', 0))
             snapshot = frame_data.get('snapshot', frame_data.get('Snapshot', {}))
             events = frame_data.get('events', frame_data.get('Events', []))
@@ -222,20 +236,6 @@ class SimulationController:
         self.log_message(f"Loaded {len(frames_data)} frames for experiment '{exp_name}' ({exp_id})")
         return exp_id, exp_name
     
-    def get_experiment_summary(self, exp_id: str) -> Dict[str, Any]:
-        if exp_id not in self._data_store: return {"error": "Experiment not found"}
-        frames = self._data_store[exp_id]
-        if not frames: return {"error": "No data available"}
-        
-        ticks = sorted(frames.keys())
-        return {
-            "experiment_id": exp_id,
-            "is_offline": self.is_offline,
-            "total_frames": len(frames),
-            "experiment_name": frames[ticks[0]].snapshot.get("experimentName", "Unknown"),
-            "current_state_tick": frames[ticks[-1]].tick
-        }
-    
     def get_brain_details(self, exp_id: str, tick: int, neuron_id: int) -> Optional[Dict[str, Any]]:
         frame = self.get_frame(exp_id, tick)
         if not frame: return None
@@ -244,7 +244,6 @@ class SimulationController:
         for neuron_data in neurons_list:
             if neuron_data.get('id') == neuron_id:
                 return neuron_data.get('brain')
-        
         return None
     
     def log_message(self, msg: str, level: str = "info"):

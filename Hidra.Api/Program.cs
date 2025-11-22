@@ -6,6 +6,7 @@ using Hidra.API.Middleware;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Serialization;
+using System.IO; // Required for Path and Directory
 
 var builder = WebApplication.CreateBuilder(args);
 Logger.Init("logging_config.json");
@@ -13,19 +14,22 @@ Logger.Init("logging_config.json");
 // --- Configure Services ---
 builder.Services.AddControllers().AddNewtonsoftJson(options =>
 {
-    // Use Newtonsoft.Json for serialization to support polymorphic types.
-    // Setting TypeNameHandling to 'Auto' includes the '$type' property for interfaces
-    // and derived classes.
     options.SerializerSettings.TypeNameHandling = TypeNameHandling.Auto;
     options.SerializerSettings.Converters.Add(new StringEnumConverter());
-    
-    // CRITICAL FIX: Enforce CamelCase (e.g., "CurrentTick" -> "currentTick").
-    // This ensures the Python client, which uses dictionary keys like frame['tick'],
-    // can correctly parse the response.
     options.SerializerSettings.ContractResolver = new CamelCasePropertyNamesContractResolver();
 });
 
+// 1. Define and create the shared storage path for experiments and the registry
+string storagePath = Path.Combine(Directory.GetCurrentDirectory(), "_experiments");
+Directory.CreateDirectory(storagePath);
+
+// 2. Register the Registry Service
+// This must be registered so EvolutionService and ExperimentsController can resolve it.
+builder.Services.AddSingleton<ExperimentRegistryService>(sp => new ExperimentRegistryService(storagePath));
+
+// 3. Register Core Services
 builder.Services.AddSingleton<ExperimentManager>();
+builder.Services.AddSingleton<EvolutionService>();
 builder.Services.AddSingleton<HglService>();
 builder.Services.AddSingleton<HglAssemblerService>(); 
 builder.Services.AddSingleton<HglDecompilerService>();
@@ -38,7 +42,10 @@ var app = builder.Build();
 // --- Configure HTTP Request Pipeline ---
 app.UseMiddleware<ErrorHandlingMiddleware>();
 
-if (app.Environment.IsDevelopment())
+// Capture this boolean BEFORE running the app to safely use it in the finally block
+bool isDevelopment = app.Environment.IsDevelopment();
+
+if (isDevelopment)
 {
     app.UseSwagger();
     app.UseSwaggerUI();
@@ -58,7 +65,7 @@ catch (Exception ex)
 }
 finally
 {
-    if (!app.Environment.IsDevelopment())
+    if (!isDevelopment)
     {
         Logger.Shutdown();
     }

@@ -36,8 +36,7 @@ class LoggingClient:
                 "Trace", "Debug", "Info", "Warning", "Error", "Fatal".
 
         Returns:
-            A dictionary containing the API response message, e.g.,
-            {"message": "Minimum log level for experiment '...' set to Trace."}
+            A dictionary containing the API response message.
         """
         if not exp_id:
             raise ValueError("Experiment ID cannot be empty.")
@@ -47,6 +46,7 @@ class LoggingClient:
             raise ValueError(f"Invalid log level '{minimum_level}'. Must be one of {valid_levels}.")
 
         endpoint = f"api/experiments/{exp_id}/logging/level"
+        # Matches C# SetLogLevelRequestDto { MinimumLevel } via camelCase serialization
         payload = {"minimumLevel": minimum_level}
         
         return self._api_client._request("PUT", endpoint, json=payload)

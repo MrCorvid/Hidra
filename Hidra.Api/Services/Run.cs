@@ -29,8 +29,8 @@ namespace Hidra.API.Services
 
         private readonly Experiment _parentExperiment;
 
-        // How many ticks to execute before momentarily releasing the lock
-        private const int TICK_CHUNK_SIZE = 100; 
+        // Lowered chunk size to ensure responsiveness during save-heavy loops
+        private const int TICK_CHUNK_SIZE = 10; 
 
         public Run(Experiment parentExperiment, CreateRunRequestDto request)
         {
@@ -40,12 +40,8 @@ namespace Hidra.API.Services
             _parentExperiment = parentExperiment;
         }
 
-        /// <summary>
-        /// Executes the run logic. Now designed to run on a background Task.
-        /// </summary>
         public void Execute()
         {
-            // Initial Setup - Atomic check
             lock (_parentExperiment.GetLockObject())
             {
                 if (_parentExperiment.State != SimulationState.Idle)
@@ -61,7 +57,6 @@ namespace Hidra.API.Services
                     StartTime = DateTime.UtcNow;
                     StartTick = _parentExperiment.World.CurrentTick;
 
-                    // Apply inputs/hormones once at start
                     if (Request.StagedInputs != null)
                         _parentExperiment.World.SetInputValues(Request.StagedInputs);
                     if (Request.StagedHormones != null)
@@ -97,21 +92,16 @@ namespace Hidra.API.Services
             }
             finally
             {
-                // Finalize state
                 lock (_parentExperiment.GetLockObject())
                 {
                     EndTick = _parentExperiment.World.CurrentTick;
                     EndTime = DateTime.UtcNow;
                     
-                    // Only mark completed if not already Failed/Aborted
                     if (Status == RunStatus.Running)
                     {
                         Status = RunStatus.Completed;
                     }
                 }
-                
-                // Save final state
-                try { _parentExperiment.SaveCurrentTickState(); } catch { /* Ignore IO errors on final save */ }
             }
         }
 
@@ -122,12 +112,10 @@ namespace Hidra.API.Services
 
             while (ticksExecuted < ticksTotal)
             {
-                // Execute a chunk
                 int chunk = Math.Min(TICK_CHUNK_SIZE, ticksTotal - ticksExecuted);
                 
                 lock (_parentExperiment.GetLockObject())
                 {
-                    // Safety check: If user manually Stopped the experiment via API during the run
                     if (_parentExperiment.State != SimulationState.Idle && _parentExperiment.State != SimulationState.Running)
                     {
                         Status = RunStatus.Aborted;
@@ -138,18 +126,16 @@ namespace Hidra.API.Services
                     for (int i = 0; i < chunk; i++)
                     {
                         _parentExperiment.World.Step();
+                        
+                        // --- CRITICAL FIX: Save EVERY tick to ensure smooth replay ---
+                        // This is slower, but ensures no "gaps" in history for the visualizer.
+                        _parentExperiment.SaveCurrentTickState();
                     }
                 }
 
                 ticksExecuted += chunk;
-
-                // Optional: Save state occasionally (e.g., every 10 chunks) to avoid data loss on crash
-                if (ticksExecuted % (TICK_CHUNK_SIZE * 10) == 0)
-                {
-                     _parentExperiment.SaveCurrentTickState();
-                }
-
-                // Yield to allow other threads (API reads) to acquire the lock if needed
+                
+                // Yield to allow API reads
                 Thread.Sleep(1);
             }
             CompletionReason = $"Completed {ticksTotal} ticks.";
@@ -167,7 +153,6 @@ namespace Hidra.API.Services
 
             while (ticksExecuted < maxTicks && !conditionMet)
             {
-                // Process one tick at a time or small chunks to check predicate
                 lock (_parentExperiment.GetLockObject())
                 {
                      if (_parentExperiment.State != SimulationState.Idle && _parentExperiment.State != SimulationState.Running)
@@ -179,6 +164,9 @@ namespace Hidra.API.Services
 
                     _parentExperiment.World.Step();
                     
+                    // --- CRITICAL FIX: Save EVERY tick ---
+                    _parentExperiment.SaveCurrentTickState();
+                    
                     if (stopCondition(_parentExperiment.World))
                     {
                         conditionMet = true;
@@ -186,9 +174,7 @@ namespace Hidra.API.Services
                 }
                 
                 ticksExecuted++;
-                
-                // Yield every 100 ticks
-                if (ticksExecuted % 100 == 0) Thread.Sleep(1);
+                Thread.Sleep(1);
             }
 
             CompletionReason = conditionMet ? "Predicate met." : "MaxTicks reached.";

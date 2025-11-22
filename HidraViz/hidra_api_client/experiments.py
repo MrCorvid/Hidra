@@ -10,7 +10,9 @@ class ExperimentsClient:
     """
     Provides methods for the ExperimentsController endpoints.
     
-    This client allows for creating, listing, retrieving, deleting, and cloning experiments.
+    This client allows for creating, listing, retrieving, deleting, cloning,
+    and renaming experiments. It supports the hierarchical Registry system 
+    (Evolution Runs -> Generations).
     """
     def __init__(self, api_client: 'HidraApiClient'):
         self._api_client = api_client
@@ -22,7 +24,7 @@ class ExperimentsClient:
                io_config: Optional[Dict[str, List[int]]] = None,
                seed: Optional[int] = None) -> Dict[str, Any]:
         """
-        Creates a new experiment from scratch.
+        Creates a new standalone (Manual) experiment from scratch.
         
         Args:
             hgl_genome (str): The HGL source code for the experiment's neurons.
@@ -51,13 +53,6 @@ class ExperimentsClient:
                 name: str = "restored-experiment") -> Dict[str, Any]:
         """
         Restores an experiment from a previously saved JSON snapshot.
-        
-        Args:
-            snapshot_json (str): The JSON content of the saved world state.
-            hgl_genome (str): The HGL source code associated with the snapshot.
-            config (dict): The Hidra configuration associated with the snapshot.
-            io_config (dict): The I/O configuration associated with the snapshot.
-            name (str): A name for the newly restored experiment.
         """
         payload = {
             "snapshotJson": snapshot_json,
@@ -71,34 +66,53 @@ class ExperimentsClient:
     def clone(self, exp_id: str, name: str, tick: int) -> Dict[str, Any]:
         """
         Clones an existing experiment starting from a specific tick.
-        
-        Args:
-            exp_id (str): The ID of the source experiment.
-            name (str): The name for the new experiment.
-            tick (int): The specific tick to clone from.
-            
-        Returns:
-            Dict[str, Any]: The details of the newly created experiment.
+        The new experiment becomes a 'Standalone' entry in the registry.
         """
         payload = {"name": name, "tick": tick}
         return self._api_client._request("POST", f"api/experiments/{exp_id}/clone", json=payload)
-        
-    def list(self, state: Optional[str] = None) -> List[Dict[str, Any]]:
+
+    def rename(self, exp_id: str, new_name: str) -> Dict[str, Any]:
         """
-        Lists all active experiments, with an optional filter by state.
+        Renames an existing experiment.
         
         Args:
-            state (str, optional): Filter by state (e.g., "Idle", "Running", "Paused").
+            exp_id (str): The ID of the experiment to rename.
+            new_name (str): The new name to assign.
+        """
+        payload = {"name": new_name}
+        return self._api_client._request("PATCH", f"api/experiments/{exp_id}", json=payload)
+        
+    def list(self, parent_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Lists experiments from the Master Registry.
+        
+        Args:
+            parent_id (str, optional): If provided, lists the children of this group 
+                                       (e.g., Organisms within an Evolution Run).
+                                       If None, lists Root items (Standalone Experiments + Evolution Runs).
+        
+        Returns:
+            List[Dict[str, Any]]: A list of experiment metadata objects, including:
+                                  - id, name, type (Standalone/EvolutionRun/GenerationOrganism)
+                                  - activity, generation, fitness, childrenCount
         """
         params = {}
-        if state:
-            params["state"] = state
+        if parent_id:
+            params["parentId"] = parent_id
+            
         return self._api_client._request("GET", "api/experiments", params=params)
 
     def get(self, exp_id: str) -> Dict[str, Any]:
-        """Retrieves detailed information for a single experiment by its ID."""
+        """
+        Retrieves detailed information for a single experiment by its ID.
+        Note: This requires the experiment to be loaded in the ExperimentManager.
+        If an Evolution Organism is not loaded, this may return 404 until you call load().
+        """
         return self._api_client._request("GET", f"api/experiments/{exp_id}")
 
     def delete(self, exp_id: str) -> None:
-        """Stops and deletes an experiment, freeing all associated resources."""
+        """
+        Stops and deletes an experiment.
+        If it is a Group (Evolution Run), this will recursively delete all children.
+        """
         self._api_client._request("DELETE", f"api/experiments/{exp_id}")

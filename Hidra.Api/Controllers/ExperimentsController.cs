@@ -9,19 +9,47 @@ using System.Collections.Generic;
 
 namespace Hidra.API.Controllers
 {
+    /// <summary>
+    /// DTO for listing experiments with hierarchical context.
+    /// </summary>
+    public class ExperimentListItemDto
+    {
+        public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public string Type { get; set; } = "Standalone"; // "Standalone", "EvolutionRun", "GenerationOrganism"
+        public string Activity { get; set; } = "Manual";
+        public int? Generation { get; set; }
+        public float? Fitness { get; set; }
+        public int ChildrenCount { get; set; }
+        public string State { get; set; } = "Unknown";
+        public ulong Tick { get; set; }
+        public DateTime CreatedAt { get; set; }
+    }
+
+    /// <summary>
+    /// DTO for updating experiment details (Renaming).
+    /// </summary>
+    public class UpdateExperimentRequestDto
+    {
+        public string? Name { get; set; }
+    }
+
     [ApiController]
     [Route("api/experiments")]
     public class ExperimentsController : ControllerBase
     {
         private readonly ExperimentManager _manager;
+        private readonly ExperimentRegistryService _registry;
 
-        public ExperimentsController(ExperimentManager manager)
+        public ExperimentsController(ExperimentManager manager, ExperimentRegistryService registry)
         {
             _manager = manager;
+            _registry = registry;
         }
 
         /// <summary>
         /// Creates a new experiment from scratch using an HGL genome.
+        /// Registers the experiment in the Master Registry as a Standalone item.
         /// </summary>
         [HttpPost]
         [ProducesResponseType(StatusCodes.Status201Created)]
@@ -31,6 +59,16 @@ namespace Hidra.API.Controllers
             try
             {
                 var experiment = _manager.CreateExperiment(body);
+
+                // Register in the persistent index
+                _registry.RegisterExperiment(new ExperimentMetadata
+                {
+                    Id = experiment.Id,
+                    Name = experiment.Name,
+                    Type = ExperimentType.Standalone,
+                    ActivityType = experiment.ActivityType,
+                    CreatedAt = DateTime.UtcNow
+                });
 
                 var response = new
                 {
@@ -60,7 +98,6 @@ namespace Hidra.API.Controllers
             HidraWorld restoredWorld;
             try
             {
-                // Decouple DTO from Core logic by passing primitives
                 restoredWorld = HidraWorld.LoadStateFromJson(
                     body.SnapshotJson, 
                     body.HGLGenome, 
@@ -74,7 +111,6 @@ namespace Hidra.API.Controllers
                 return BadRequest(new { error = "RestoreFailed", message = $"Failed to load world state from JSON: {ex.Message}"}); 
             }
             
-            // Create a compatible creation request for the manager wrapper
             var createRequest = new CreateExperimentRequestDto
             {
                 Name = body.Name,
@@ -84,6 +120,16 @@ namespace Hidra.API.Controllers
             };
 
             var experiment = _manager.CreateExperimentFromWorld(createRequest, restoredWorld);
+
+            // Register restoration
+            _registry.RegisterExperiment(new ExperimentMetadata
+            {
+                Id = experiment.Id,
+                Name = experiment.Name,
+                Type = ExperimentType.Standalone,
+                ActivityType = experiment.ActivityType,
+                CreatedAt = DateTime.UtcNow
+            });
 
             var response = new
             {
@@ -99,12 +145,7 @@ namespace Hidra.API.Controllers
 
         /// <summary>
         /// Clones an existing experiment starting from a specific tick.
-        /// The new experiment will contain history up to the specified tick and 
-        /// will start simulation exactly from that point.
         /// </summary>
-        /// <param name="expId">The ID of the source experiment to clone.</param>
-        /// <param name="body">DTO containing the new name and the target tick.</param>
-        /// <returns>The details of the newly created experiment.</returns>
         [HttpPost("{expId}/clone")]
         [ProducesResponseType(StatusCodes.Status201Created)]
         [ProducesResponseType(StatusCodes.Status404NotFound)]
@@ -115,6 +156,16 @@ namespace Hidra.API.Controllers
             try
             {
                 var newExperiment = _manager.CloneExperiment(expId, body);
+
+                // Register clone
+                _registry.RegisterExperiment(new ExperimentMetadata
+                {
+                    Id = newExperiment.Id,
+                    Name = newExperiment.Name,
+                    Type = ExperimentType.Standalone,
+                    ActivityType = newExperiment.ActivityType,
+                    CreatedAt = DateTime.UtcNow
+                });
 
                 var response = new
                 {
@@ -133,7 +184,6 @@ namespace Hidra.API.Controllers
             }
             catch (InvalidOperationException ex)
             {
-                // Usually occurs if source is running/not idle
                 return Conflict(new { error = "Conflict", message = ex.Message });
             }
             catch (ArgumentOutOfRangeException ex)
@@ -147,43 +197,95 @@ namespace Hidra.API.Controllers
         }
 
         /// <summary>
-        /// Lists all active experiments, with an optional filter by state.
+        /// Updates an experiment's metadata (e.g., Name).
         /// </summary>
-        /// <param name="state">Optional filter to return only experiments in a specific state (e.g., "running", "paused").</param>
-        /// <returns>A list of experiment summaries.</returns>
-        [HttpGet]
-        public IActionResult ListExperiments([FromQuery] string? state)
+        [HttpPatch("{expId}")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public IActionResult UpdateExperiment(string expId, [FromBody] UpdateExperimentRequestDto body)
         {
-            SimulationState? stateFilter = null;
-            if (!string.IsNullOrEmpty(state) && Enum.TryParse<SimulationState>(state, ignoreCase: true, out var parsedState))
+            if (string.IsNullOrWhiteSpace(body.Name))
+                return BadRequest(new { error = "InvalidName", message = "Name cannot be empty." });
+
+            // 1. Update in Memory/Disk Manager (handles .db metadata and active instance)
+            // Note: You must ensure ExperimentManager has the RenameExperiment method implemented.
+            if (!_manager.RenameExperiment(expId, body.Name))
             {
-                stateFilter = parsedState;
+                return NotFound(new { error = "NotFound", message = $"Experiment '{expId}' not found in manager." });
             }
 
-            var experiments = _manager.ListExperiments(stateFilter)
-                .Select(exp => new
-                {
-                    id = exp.Id,
-                    name = exp.Name,
-                    state = exp.State.ToString().ToLowerInvariant(),
-                    tick = exp.World.CurrentTick
-                });
+            // 2. Update in Master Registry (handles UI list view)
+            // Note: You must ensure ExperimentRegistryService has the UpdateName method implemented.
+            _registry.UpdateName(expId, body.Name);
 
-            return Ok(experiments);
+            return Ok(new { message = "Experiment updated.", name = body.Name });
+        }
+
+        /// <summary>
+        /// Lists experiments with optional hierarchical filtering.
+        /// Uses the Master Registry for structure and ExperimentManager for live status.
+        /// </summary>
+        /// <param name="parentId">If provided, lists children of this group. If null, lists root items.</param>
+        [HttpGet]
+        public IActionResult ListExperiments([FromQuery] string? parentId = null)
+        {
+            IEnumerable<ExperimentMetadata> items;
+            
+            // 1. Query Registry for hierarchy
+            var allRegistryItems = _registry.GetAll().ToList();
+
+            if (string.IsNullOrEmpty(parentId))
+            {
+                // Root items (Standalone or Evolution Groups)
+                items = allRegistryItems.Where(x => string.IsNullOrEmpty(x.ParentGroupId));
+            }
+            else
+            {
+                // Children (Organisms within a Run)
+                items = allRegistryItems.Where(x => x.ParentGroupId == parentId);
+            }
+
+            // 2. Map to DTOs, enriching with live data if available
+            var dtos = items.Select(meta =>
+            {
+                // Check if currently loaded in memory
+                var liveExp = _manager.GetExperiment(meta.Id);
+                
+                return new ExperimentListItemDto
+                {
+                    Id = meta.Id,
+                    Name = meta.Name,
+                    Type = meta.Type.ToString(),
+                    Activity = meta.ActivityType,
+                    Generation = meta.GenerationIndex,
+                    Fitness = meta.FitnessScore,
+                    // Count how many children point to this ID
+                    ChildrenCount = allRegistryItems.Count(c => c.ParentGroupId == meta.Id),
+                    CreatedAt = meta.CreatedAt,
+                    // Live status or default based on Type
+                    State = liveExp?.State.ToString() ?? (meta.Type == ExperimentType.EvolutionRun ? "Archive" : "Unloaded"),
+                    Tick = liveExp?.World.CurrentTick ?? 0
+                };
+            });
+
+            return Ok(dtos);
         }
 
         /// <summary>
         /// Gets detailed information for a single experiment by its ID.
+        /// Supports Lazy Loading via the ExperimentManager.
         /// </summary>
-        /// <param name="expId">The unique identifier of the experiment.</param>
-        /// <returns>The detailed state of the experiment, or 404 if not found.</returns>
         [HttpGet("{expId}")]
         public IActionResult GetExperiment(string expId)
         {
+            // ExperimentManager.GetExperiment handles both memory lookup and disk-based lazy loading.
             var exp = _manager.GetExperiment(expId);
+
             if (exp == null)
             {
-                return NotFound(new { error = "NotFound", message = $"Experiment with ID '{expId}' not found." });
+                // If it wasn't found in memory OR on disk (as a .db file), it truly doesn't exist in a runnable state.
+                return NotFound(new { error = "NotFound", message = $"Experiment with ID '{expId}' not found or could not be loaded." });
             }
 
             return Ok(new
@@ -191,6 +293,7 @@ namespace Hidra.API.Controllers
                 id = exp.Id,
                 name = exp.Name,
                 state = exp.State.ToString().ToLowerInvariant(),
+                activity = exp.ActivityType,
                 tick = exp.World.CurrentTick,
                 seed = exp.Seed,
                 config = exp.World.Config
@@ -200,19 +303,33 @@ namespace Hidra.API.Controllers
         /// <summary>
         /// Stops and deletes an experiment, freeing all associated resources.
         /// </summary>
-        /// <param name="expId">The unique identifier of the experiment to delete.</param>
-        /// <returns>A 204 No Content response on success, or 404 if not found.</returns>
         [HttpDelete("{expId}")]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status404NotFound)]
         public IActionResult DeleteExperiment(string expId)
         {
-            if (_manager.DeleteExperiment(expId))
+            // 1. Stop/Unload from memory and delete simulation DB files
+            bool deletedFromDisk = _manager.DeleteExperiment(expId);
+            
+            // 2. Remove from Master Registry
+            // Note: If this is a group, ExperimentRegistryService.DeleteExperiment handles recursive deletion of metadata entries.
+            _registry.DeleteExperiment(expId);
+
+            if (deletedFromDisk)
             {
                 return NoContent();
             }
             
-            return NotFound(new { error = "NotFound", message = $"Experiment with ID '{expId}' not found." });
+            // If it wasn't in the manager but was in registry, check registry success
+            var meta = _registry.Get(expId);
+            
+            // If meta is null, it means it was successfully deleted (or never existed)
+            if (meta == null)
+            {
+                return NoContent(); 
+            }
+
+            return NotFound(new { error = "NotFound", message = $"Experiment with ID '{expId}' could not be deleted." });
         }
     }
 }

@@ -8,6 +8,7 @@ using System.IO;
 using Hidra.Core;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Newtonsoft.Json.Serialization;
 using System.Reflection;
 
 namespace Hidra.API.Services
@@ -29,9 +30,14 @@ namespace Hidra.API.Services
             var dbFiles = Directory.GetFiles(_baseStoragePath, "*.db");
             foreach (var file in dbFiles)
             {
+                // Skip the master registry database to prevent loading errors
+                if (Path.GetFileName(file).Equals("master_registry.db", StringComparison.OrdinalIgnoreCase)) 
+                    continue;
+
                 try
                 {
                     string expId = Path.GetFileNameWithoutExtension(file);
+                    // We attempt to load it to verify integrity and resume state.
                     var experiment = LoadExperimentFromDb(expId);
                     if (experiment != null)
                     {
@@ -81,7 +87,8 @@ namespace Hidra.API.Services
                  var field = typeof(HidraWorld).GetField("_hglGenome", BindingFlags.NonPublic | BindingFlags.Instance);
                  if (field != null)
                  {
-                     genomeToSave = (string)field.GetValue(world) ?? "";
+                     var val = field.GetValue(world);
+                     genomeToSave = val as string ?? "";
                  }
             }
 
@@ -127,8 +134,58 @@ namespace Hidra.API.Services
                 throw new InvalidOperationException("Failed to load the cloned experiment.");
             }
 
+            // --- CRITICAL FIX: Unlock the clone so it is writable/runnable ---
+            newExperiment.Unlock();
+            // ----------------------------------------------------------------
+
             _experiments.TryAdd(newExpId, newExperiment);
             return newExperiment;
+        }
+
+        /// <summary>
+        /// Renames an experiment in both memory and persistent storage.
+        /// </summary>
+        public bool RenameExperiment(string expId, string newName)
+        {
+            bool found = false;
+
+            // 1. Update In-Memory Instance if active
+            if (_experiments.TryGetValue(expId, out var exp))
+            {
+                exp.Rename(newName);
+                found = true;
+            }
+
+            // 2. Update Persistence (Disk Metadata)
+            // Even if not currently loaded in memory, update the DB file if it exists.
+            string dbPath = Path.Combine(_baseStoragePath, $"{expId}.db");
+            if (File.Exists(dbPath))
+            {
+                try 
+                {
+                    // Use a short-lived DB service just to update metadata
+                    using var db = new ExperimentDbService(_baseStoragePath, expId);
+                    db.SaveMetadata("Name", newName);
+                    found = true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ExperimentManager] Error updating name metadata for {expId}: {ex.Message}");
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// Manually registers an experiment that was loaded externally (e.g., via Lazy Loading in the controller).
+        /// </summary>
+        public void RegisterLoadedExperiment(Experiment exp)
+        {
+            if (exp != null && !string.IsNullOrEmpty(exp.Id))
+            {
+                _experiments.TryAdd(exp.Id, exp);
+            }
         }
 
         private Experiment? LoadExperimentFromDb(string expId, ulong tickToLoad = 0)
@@ -143,6 +200,7 @@ namespace Hidra.API.Services
                 var name = db.GetMetadata("Name") ?? "unnamed_recovered";
                 var configJson = db.GetMetadata("Config");
                 var hglGenome = db.GetMetadata("Genome") ?? ""; 
+                var activityType = db.GetMetadata("ActivityType") ?? "Manual"; 
 
                 var config = !string.IsNullOrEmpty(configJson) 
                     ? JsonConvert.DeserializeObject<HidraConfig>(configJson) 
@@ -166,11 +224,8 @@ namespace Hidra.API.Services
                     throw new InvalidOperationException("Failed to deserialize world state from persistence wrapper.");
 
                 // --- ROBUST ID EXTRACTION ---
-                // We need to find 'InputNodes' OR 'inputNodes' (and internal field '_inputNodes')
-                // because the ContractResolver in Program.cs now forces CamelCase, but older DBs might be PascalCase.
                 var jObj = JObject.Parse(persistedTick.WorldStateJson);
                 
-                // Helper to find a property regardless of casing
                 JToken? GetPropertyCaseInsensitive(JObject obj, string name)
                 {
                     return obj.GetValue(name, StringComparison.OrdinalIgnoreCase) 
@@ -195,7 +250,9 @@ namespace Hidra.API.Services
                 );
 
                 db.Dispose(); 
-                return new Experiment(expId, name, world, _baseStoragePath);
+                
+                // Pass activityType to the constructor
+                return new Experiment(expId, name, world, _baseStoragePath, activityType);
             }
             catch (Exception)
             {
@@ -204,10 +261,39 @@ namespace Hidra.API.Services
             }
         }
 
+        /// <summary>
+        /// Retrieves an experiment by ID.
+        /// Includes Automatic Lazy Loading from disk if the experiment exists but is not in memory.
+        /// </summary>
         public Experiment? GetExperiment(string id)
         {
-            _experiments.TryGetValue(id, out var experiment);
-            return experiment;
+            // 1. Check Memory
+            if (_experiments.TryGetValue(id, out var experiment))
+            {
+                return experiment;
+            }
+
+            // 2. Check Disk (Lazy Load)
+            string dbPath = Path.Combine(_baseStoragePath, $"{id}.db");
+            if (File.Exists(dbPath))
+            {
+                try
+                {
+                    var loadedExp = LoadExperimentFromDb(id);
+                    if (loadedExp != null)
+                    {
+                        _experiments.TryAdd(id, loadedExp);
+                        Console.WriteLine($"[ExperimentManager] Lazy loaded experiment from disk: {id}");
+                        return loadedExp;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ExperimentManager] Failed to lazy load {id}: {ex.Message}");
+                }
+            }
+
+            return null;
         }
 
         public IEnumerable<Experiment> ListExperiments(SimulationState? stateFilter = null)
@@ -235,6 +321,19 @@ namespace Hidra.API.Services
                 }
                 return true;
             }
+            
+            // If not in memory, check if file exists and delete it anyway
+            string path = Path.Combine(_baseStoragePath, $"{id}.db");
+            if (File.Exists(path))
+            {
+                try
+                {
+                    File.Delete(path);
+                    return true;
+                }
+                catch { return false; }
+            }
+
             return false;
         }
 
@@ -245,12 +344,19 @@ namespace Hidra.API.Services
         }
     }
 
+    /// <summary>
+    /// Helper class to handle polymorphic deserialization of PersistedTick.
+    /// Defines which DTO types are allowed during JSON deserialization.
+    /// </summary>
     public class ApiSerializationBinder : HidraSerializationBinder
     {
         public new Type BindToType(string? assemblyName, string typeName)
         {
-            if (typeName == "Hidra.API.DTOs.PersistedTick")
+            // Specifically bind PersistedTick which is defined in the API assembly
+            if (typeName == "Hidra.API.DTOs.PersistedTick" || typeName.EndsWith("PersistedTick"))
                 return typeof(PersistedTick);
+            
+            // Delegate to core binder for everything else (HidraWorld, Config, etc.)
             return base.BindToType(assemblyName, typeName);
         }
     }

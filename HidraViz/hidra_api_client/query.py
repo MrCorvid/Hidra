@@ -20,11 +20,17 @@ class QueryClient:
         """
         Retrieves the complete history of an experiment as a series of replay frames.
 
+        The server deserializes compressed snapshots and returns a list of
+        ReplayFrameDto objects containing:
+        - tick: The simulation tick.
+        - snapshot: The full VisualizationSnapshotDto (neurons, synapses, values).
+        - events: A list of events processed during that tick.
+
         Args:
             exp_id (str): The ID of the experiment.
 
         Returns:
-            List[Dict[str, Any]]: A list of ReplayFrame-like dictionaries.
+            List[Dict[str, Any]]: A list of ReplayFrame dictionaries.
         """
         return self._api_client._request("GET", f"api/experiments/{exp_id}/query/history")
 
@@ -75,17 +81,6 @@ class QueryClient:
     def get_visualization_snapshot(self, exp_id: str) -> Dict[str, Any]:
         """
         Retrieves a complete snapshot of the world's state for visualization.
-
-        This single call returns the static structure (neurons, synapses, brains)
-        and the current dynamic state (potentials, health, etc.) of the entire
-        simulation world.
-
-        Args:
-            exp_id (str): The ID of the experiment.
-
-        Returns:
-            Dict[str, Any]: A dictionary representing the complete world state,
-                            matching the VisualizationSnapshotDto structure.
         """
         return self._api_client._request("GET", f"api/experiments/{exp_id}/query/visualize")
 
@@ -93,7 +88,7 @@ class QueryClient:
 
     def get_logs(self, exp_id: str, level: Optional[str] = None, tag: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Retrieves experiment logs as structured JSON objects.
+        Retrieves experiment logs as structured JSON objects (Timestamp, Level, Tag, Message).
         
         Args:
             exp_id (str): The ID of the experiment.
@@ -110,16 +105,10 @@ class QueryClient:
     def get_logs_as_text(self, exp_id: str, level: Optional[str] = None, tag: Optional[str] = None) -> str:
         """
         Retrieves experiment logs as a single plain text string.
-        
-        Args:
-            exp_id (str): The ID of the experiment.
-            level (str, optional): The minimum log level to retrieve (e.g., 'Info', 'Warning').
-            tag (str, optional): A specific tag to filter logs by.
         """
         params = {}
         if level:
             params["level"] = level
         if tag:
             params["tag"] = tag
-        # Use the dedicated text request method from the core client
         return self._api_client._request_text("GET", f"api/experiments/{exp_id}/query/logs/text", params=params)
